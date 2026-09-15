@@ -395,7 +395,8 @@ export function buildRendererPayload(input: PayloadInput) {
       prototype.attachShadow = wrapped;
       return { prototype, original, wrapped };
     };
-    shadowPatch = patchAttachShadow();
+    // Grok Bot 的右侧电脑预览由独立 webview 承载，不需要接管 Shadow DOM。
+    // 不重写 attachShadow，避免影响 React/组件库自己的封装。
 
     const detectAppearance = () => {
       const root = document.documentElement;
