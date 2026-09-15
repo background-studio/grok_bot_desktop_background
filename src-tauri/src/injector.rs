@@ -443,7 +443,7 @@ const EARLY_TRANSPARENCY_SCRIPT: &str = r#"(() => {
   try {
     const style = document.createElement("style");
     style.id = "grok-background-early-transparency";
-    style.textContent = "html,body,#root,.bg-app-shell,[data-slot=sidebar-wrapper],[data-sidebar=sidebar],[data-slot=sidebar-inner],[data-sidebar=menu-button][data-active],[data-sidebar=menu-button]:hover,[data-sidebar=menu-button]:focus-visible,.bg-page-canvas,.bg-page-canvas .bg-background,.bg-card,header,[role=button][aria-roledescription=sortable]>a[href*='/issues/']>[class~=bg-surface]{background:transparent!important;background-color:transparent!important}";
+    style.textContent = "html,body,#root,.sand-shell,.sand-agents-sidebar,.sand-chat,.sand-chat-stage,.sand-chat-input-dock,.sand-input-area,.sand-kit-message-input-frame,.sand-info-pane__inner,.ui-scroll-area__viewport,.bg-app-shell,[data-slot=sidebar-wrapper],[data-sidebar=sidebar],[data-slot=sidebar-inner],[data-sidebar=menu-button][data-active],[data-sidebar=menu-button]:hover,[data-sidebar=menu-button]:focus-visible,.bg-page-canvas,.bg-page-canvas .bg-background,.bg-card,header,[role=button][aria-roledescription=sortable]>a[href*='/issues/']>[class~=bg-surface]{background:transparent!important;background-color:transparent!important}";
     (document.documentElement || document).appendChild(style);
   } catch {}
 })()"#;
