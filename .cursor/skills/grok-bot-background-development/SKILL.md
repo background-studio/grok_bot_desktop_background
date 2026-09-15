@@ -1,6 +1,6 @@
 ---
-name: grok-background-development
-description: Maintains Grok Background Studio, including CDP injection, Electron WCO transparent titlebar, Grok page and panel transparency, media/slideshow behavior, Background Studio plugin packaging, debugging, and release verification. Use when changing this repository or investigating a Grok desktop UI surface that does not follow background settings.
+name: grok-bot-background-development
+description: Maintains Grok Background Studio, including CDP injection, Grok page and panel transparency, media/slideshow behavior, Background Studio plugin packaging, debugging, and release verification. Use when changing this repository or investigating a Grok Bot desktop UI surface that does not follow background settings.
 ---
 
 # Grok Background Studio 开发
@@ -15,7 +15,7 @@ description: Maintains Grok Background Studio, including CDP injection, Electron
 动手前按需读取：
 
 - 页面入口、DOM 特征、透明度归属：[windows-and-selectors.md](windows-and-selectors.md)
-- 架构、WCO、故障经验、安全边界：[architecture-and-pitfalls.md](architecture-and-pitfalls.md)
+- 架构、故障经验、安全边界：[architecture-and-pitfalls.md](architecture-and-pitfalls.md)
 
 ## 不可破坏的原则
 
@@ -31,16 +31,15 @@ description: Maintains Grok Background Studio, including CDP injection, Electron
 10. 更改共享设置时同步修改 contracts、默认值、规范化、UI、payload 和测试。
 11. 壳层雾度用 `color-mix(... calc(opacity * 28%), transparent)`；侧栏选中/悬停、
     任务卡片等「实色块」用 `* 100%`，避免滑杆到高值变成实心黑罩或块太淡看不见。
-12. **标题栏必须走 Electron WCO**，不要再做独立 Win32 覆盖窗去盖原生 caption。
-13. WCO 启动失败要能回退到普通 CDP 启动，且不能把 Grok 主进程留在 debugger pause。
+12. Grok Bot 自带标题栏和右侧电脑 webview；插件只改主 renderer，绝不接管 webview 或窗口按钮。
 
 ## 代码入口
 
 - `src-tauri/src/lib.rs`：Tauri/Rust 主后端、命令、轮播和共享状态。
 - `src-tauri/src/host.rs`：托盘、窗口生命周期、退出恢复和 Windows 自启动。
-- `src-tauri/src/controller.rs`：发现官方 `Grok.exe`、校验进程、启动 Grok、
-  保存和恢复 CDP 会话；需要透明标题栏时走 WCO 启动。
-- `src-tauri/src/electron_wco.rs`：用 `--inspect-brk` 在 BrowserWindow 创建前打透明 WCO 补丁。
+- `src-tauri/src/controller.rs`：发现官方 `Grok Bot.exe`、校验进程、启动 Grok、
+  保存和恢复 CDP 会话；Grok Bot 自带标题栏，不做窗口补丁。
+- `（无；Grok Bot 自带标题栏）`：用 `--inspect-brk` 在 BrowserWindow 创建前打透明 WCO 补丁。
 - `src-tauri/src/injector.rs`：Rust CDP target 同步、早期脚本、运行时更新、暂停和移除；
   含 `window_controls_overlay_visible` 探测。
 - `src-tauri/src/media.rs`、`network.rs`、`preview.rs`、`settings.rs`：媒体、安全下载、预览和事务设置。
@@ -55,13 +54,13 @@ description: Maintains Grok Background Studio, including CDP injection, Electron
 
 优先路径：
 
-1. `%LOCALAPPDATA%\Programs\@grokdesktop\Grok.exe`
-2. `%LOCALAPPDATA%\Programs\Grok\Grok.exe`
-3. `%ProgramFiles%\Grok\Grok.exe`
+1. `%LOCALAPPDATA%\Programs\@grokdesktop\Grok Bot.exe`
+2. `%LOCALAPPDATA%\Programs\Grok\Grok Bot.exe`
+3. `%ProgramFiles%\Grok\Grok Bot.exe`
 
-首选调试口：`9227`。主进程 Inspector 首选：`9238`。
+首选调试口：`9337`。主进程 Inspector 首选：`9238`。
 运行时状态：`%LOCALAPPDATA%\GrokBackgroundStudio\runtime.json`
-（`schemaVersion >= 2` 且 `wcoEnabled: true` 才视为可恢复的透明标题栏会话）。
+（`schemaVersion >= 2` 且 `rendererEnabled: true` 才视为可恢复的透明标题栏会话）。
 
 插件安装目录（壳）：`%LOCALAPPDATA%\BackgroundStudio\plugins\grok\<version>\`。
 
@@ -83,7 +82,7 @@ Rust 使用 Cargo。Vite 开发地址默认 `http://127.0.0.1:5175/`。
 
 先判断问题属于哪一类：
 
-- Windows 原生标题栏 / 最小化最大化关闭：归 **WCO**（`electron_wco.rs` + payload 安全区），
+- Windows 原生标题栏 / 最小化最大化关闭：归 **WCO**（`electron_renderer.rs` + payload 安全区），
   不是 `surfaceOpacity` 能单独解决的。
 - 左侧边栏壳：归 `sidebarOpacity`（`* 28%` 雾）。
 - 侧栏选中项 / 悬停项：仍归 `sidebarOpacity`，但用 `* 100%` 打底。
@@ -101,7 +100,7 @@ Rust 使用 Cargo。Vite 开发地址默认 `http://127.0.0.1:5175/`。
 
 - `127.0.0.1` 回环地址；
 - browser ID 与状态文件一致的实例；
-- page target 为 Grok Electron renderer（`file://.../out/renderer/index.html`）。
+- page target 为 Grok renderer（`file://.../out/renderer/index.html`）。
 
 探查内容至少包括：
 
@@ -111,7 +110,7 @@ Rust 使用 Cargo。Vite 开发地址默认 `http://127.0.0.1:5175/`。
 - `::before`、`::after`；
 - 元素祖先链；
 - 标题栏问题额外查 `navigator.windowControlsOverlay` 是否 visible，以及顶栏
-  `padding-right` / `--cbg-wco-safe-right`。
+  `padding-right` / `--cbg-renderer-safe-right`。
 
 截图验证前后状态。不要把探查脚本或截图提交进仓库。
 
@@ -123,7 +122,7 @@ Rust 使用 Cargo。Vite 开发地址默认 `http://127.0.0.1:5175/`。
 - 看板卡片：只打
   `[role="button"][aria-roledescription="sortable"] > a[href*="/issues/"] > [class~="bg-surface"]`，
   不要降低整列或文字透明度。
-- 标题栏：只允许改 `electron_wco.rs` 的 BrowserWindow 代理 + payload WCO 安全区；
+- 标题栏：只允许改 `electron_renderer.rs` 的 BrowserWindow 代理 + payload WCO 安全区；
   **禁止**新建独立 overlay HWND 去盖 caption。
 - 全页壳：清 `.bg-app-shell`、`[data-slot="sidebar-wrapper"]` 实底，由侧栏/画布各自打底。
 
@@ -137,7 +136,7 @@ early 只注入透明化 CSS，完整媒体脚本只走一次 `Runtime.evaluate`
 - 移除 style、layer；
 - 断开 observer、timer、WCO `geometrychange` 监听；
 - 撤销 Blob URL；
-- 删除根 class 和 CSS 变量（含 `--cbg-wco-safe-right`、`--cbg-card-opacity`）。
+- 删除根 class 和 CSS 变量（含 `--cbg-renderer-safe-right`、`--cbg-card-opacity`）。
 
 ### 6. 验证
 

@@ -14,7 +14,7 @@ Grok 更新后 DOM 可能变；改样式前必须再用 CDP 核对，不要只�
 ## 注入根标记
 
 - `html.grok-background-active`
-- WCO 会话：`html.grok-background-wco`
+- WCO 会话：`html.grok-background-renderer`
 - 路由：`grok-background-home` / `grok-background-task`
 - 媒体层：`#grok-background-layer` / `#grok-background-media` /
   `#grok-background-tile` / `#grok-background-overlay`
@@ -26,10 +26,10 @@ Grok 更新后 DOM 可能变；改样式前必须再用 CDP 核对，不要只�
 - 用户入口：窗口最上方、原生最小化/最大化/关闭按钮所在区域。
 - **不能**用独立 Tauri/Win32 覆盖窗去盖原生 caption（会白/黑条、抖动、挡按钮）。
 - 正确做法：启动时把 Grok `BrowserWindow` 改成
-  `titleBarStyle: "hidden"` + 透明 `titleBarOverlay`（见 `electron_wco.rs`）。
-- 渲染页标记：`html.grok-background-wco`
+  `titleBarStyle: "hidden"` + 透明 `titleBarOverlay`（见 `electron_renderer.rs`）。
+- 渲染页标记：`html.grok-background-renderer`
 - 顶栏为原生按钮预留右侧：
-  `header.relative.shrink-0.h-12` + `--cbg-wco-safe-right`
+  `header.relative.shrink-0.h-12` + `--cbg-renderer-safe-right`
 - 安全区来源：`navigator.windowControlsOverlay` 的 `getTitlebarAreaRect()` /
   `geometrychange`；无 WCO API 时不要瞎写死很大的 padding。
 - 验证：`window_controls_overlay_visible`（injector）为 true；按钮可点；
@@ -68,7 +68,7 @@ Grok 更新后 DOM 可能变；改样式前必须再用 CDP 核对，不要只�
 - 稳定入口：`.bg-page-canvas`、`header`、`[data-slot="card"]`、
   `[data-slot="chat-input-surface"]`、创建页底栏 `.pe-chat-launcher`
 - 透明度：`--cbg-surface-opacity`，雾度 `* 28%`
-- WCO 时顶栏额外吃 `--cbg-wco-safe-right`
+- WCO 时顶栏额外吃 `--cbg-renderer-safe-right`
 - **内层实底**：Create Agent 等路由会在 canvas 内再铺
   `.bg-page-canvas .bg-background`（`oklch(...)` 实色）。外层 canvas 已打雾时，
   内层必须强制透明，否则整页发黑、背景“整个没有”。
@@ -156,7 +156,7 @@ Grok 更新后 DOM 可能变；改样式前必须再用 CDP 核对，不要只�
 
 ```
 --remote-debugging-address=127.0.0.1
---remote-debugging-port=9227
+--remote-debugging-port=9337
 --remote-allow-origins=*
 ```
 

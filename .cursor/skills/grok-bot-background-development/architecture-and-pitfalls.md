@@ -10,10 +10,10 @@
    - `%ProgramFiles%\Grok\Grok.exe`
 2. 校验可执行路径，读取版本。
 3. 若已有未启用 CDP 的 Grok，要求用户确认重启。
-4. **优先**走 `electron_wco::launch_with_transparent_wco`（CDP + 主进程 Inspector）；
+4. **优先**走 `electron_renderer::launch_with_transparent_renderer`（CDP + 主进程 Inspector）；
    WCO 失败则回退普通 `launch_grok`（仅 renderer CDP）。
-5. 首选调试口 **9227**（占用则向后试），等待 `/json/version`。
-6. 保存 `schemaVersion`、port、browser ID、executable、`wcoEnabled` 到 `runtime.json`。
+5. 首选调试口 **9337**（占用则向后试），等待 `/json/version`。
+6. 保存 `schemaVersion`、port、browser ID、executable、`rendererEnabled` 到 `runtime.json`。
 7. `injector.rs` 只接受同一 browser ID、回环 WebSocket、Grok renderer page。
 8. 为每个 target 开启 Runtime/Page、临时 bypass CSP。
 9. `Page.addScriptToEvaluateOnNewDocument` 注册早期 payload（大媒体则只注册透明化）。
@@ -33,7 +33,7 @@
 
 目标：让网页内容铺进标题栏区域，同时保留 Windows 原生最小化/最大化/关闭。
 
-核心文件：`src-tauri/src/electron_wco.rs`。
+核心文件：`src-tauri/src/electron_renderer.rs`。
 
 步骤概要：
 
@@ -50,11 +50,11 @@
    - `titleBarStyle = "hidden"`
    - `titleBarOverlay = { color: "rgba(0,0,0,0)", symbolColor: "#ffffff", height: 48 }`
 6. resume，等到 renderer 上报 `windowControlsOverlay` visible。
-7. 关闭 Inspector；写入 `runtime.json` 的 `wcoEnabled: true`、`schemaVersion: 2`。
-8. payload 加 `grok-background-wco`，用 `navigator.windowControlsOverlay`
-   维护 `--cbg-wco-safe-right`。
+7. 关闭 Inspector；写入 `runtime.json` 的 `rendererEnabled: true`、`schemaVersion: 2`。
+8. payload 加 `grok-background-renderer`，用 `navigator.windowControlsOverlay`
+   维护 `--cbg-renderer-safe-right`。
 
-旧会话过滤：`schemaVersion` 过旧或 `wcoEnabled != true` 的 runtime 不能当透明标题栏会话复用，
+旧会话过滤：`schemaVersion` 过旧或 `rendererEnabled != true` 的 runtime 不能当透明标题栏会话复用，
 应重新走 WCO 启动（或明确回退）。
 
 ### 为什么不用 Win32 覆盖窗
@@ -284,7 +284,7 @@ sortable issue 链接内的 `bg-surface`。
 ### 推荐
 
 - 先 `npm run dev` 调试 Tauri Studio（Vite `5175`）。
-- 用一次性脚本连 Grok renderer CDP（9227）和必要时主进程 Inspector（9238）。
+- 用一次性脚本连 Grok renderer CDP（9337）和必要时主进程 Inspector（9238）。
 - 把 DOM、计算样式、`windowControlsOverlay`、截图作为证据。
 - 对动态页面测试导航后、悬停后、重载后状态。
 
