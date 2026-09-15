@@ -314,20 +314,14 @@ export function buildRendererPayload(input: PayloadInput) {
       if (previous?.timer) clearInterval(previous.timer);
       previous?.wco?.removeEventListener?.("geometrychange", previous?.wcoGeometry);
       previous?.layer?.remove();
-      if (previous?.blobUrl) URL.revokeObjectURL(previous.blobUrl);
+      if (previous?.blobUrl?.startsWith?.("blob:")) URL.revokeObjectURL(previous.blobUrl);
     }
     let scheduled = null;
     let shadowPatch = null;
 
-    const blobUrl = (() => {
-      const comma = config.mediaUrl.indexOf(",");
-      if (!config.mediaUrl.startsWith("data:") || comma < 0) return config.mediaUrl;
-      const binary = atob(config.mediaUrl.slice(comma + 1));
-      const bytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-      const mime = /^data:([^;,]+)/.exec(config.mediaUrl)?.[1] || "application/octet-stream";
-      return URL.createObjectURL(new Blob([bytes], { type: mime }));
-    })();
+    // 小媒体的 early payload 已经是可直接解码的 data URL；保持原值可避免
+    // Grok renderer 沙箱对 file:// 页面创建的 blob URL 拒绝解码。
+    const blobUrl = config.mediaUrl;
 
     const installReviewShadowStyle = (host, shadow = host?.shadowRoot) => {
       if (!shadow) return false;
@@ -376,7 +370,7 @@ export function buildRendererPayload(input: PayloadInput) {
       });
       document.documentElement?.classList.remove(...ROOT_CLASSES);
       for (const property of ROOT_PROPERTIES) document.documentElement?.style.removeProperty(property);
-      if (state?.blobUrl) URL.revokeObjectURL(state.blobUrl);
+      if (state?.blobUrl?.startsWith?.("blob:")) URL.revokeObjectURL(state.blobUrl);
       delete window[STATE];
       return true;
     };
