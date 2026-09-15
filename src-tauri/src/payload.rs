@@ -114,7 +114,6 @@ pub fn build_active_payload_from_bytes(
     if !inline_script.contains(&sentinel_literal) {
         return Err("背景媒体占位符生成失败。".to_string());
     }
-    let script = inline_script.replacen(&sentinel_literal, &pending_expression, 1);
     let early_script = if bytes.len() <= MAX_EARLY_INLINE_MEDIA_BYTES {
         let media_url = format!("data:{mime_type};base64,{}", STANDARD.encode(&bytes));
         let candidate = render_script(&media_url, kind, display, &payload_revision)?;
@@ -122,6 +121,11 @@ pub fn build_active_payload_from_bytes(
     } else {
         None
     };
+    // 小媒体直接复用 data URL，避免 Grok Bot 的 file:// renderer 对 blob:file URL
+    // 解码失败；大媒体仍通过受限分块上传并使用 Blob URL。
+    let script = early_script
+        .clone()
+        .unwrap_or_else(|| inline_script.replacen(&sentinel_literal, &pending_expression, 1));
     Ok(ActivePayload {
         script,
         revision: payload_revision,
@@ -172,8 +176,7 @@ mod tests {
             .script
             .contains(r#"[role=\"dialog\"] [class~=\"max-w-6xl\"]"#));
         assert!(payload.script.contains(r#"[class~=\"bg-muted/30\"]"#));
-        assert!(payload.script.contains(PENDING_MEDIA_URL_KEY));
-        assert!(!payload.script.contains("data:image/png;base64,"));
+        assert!(payload.script.contains("data:image/png;base64,"));
         assert!(payload
             .early_script
             .as_deref()
@@ -196,5 +199,6 @@ mod tests {
         assert!(payload.early_script.is_none());
         assert!(payload.script.len() < MAX_EARLY_SCRIPT_BYTES);
         assert!(!payload.script.contains("data:image/png;base64,"));
+        assert!(payload.script.contains(PENDING_MEDIA_URL_KEY));
     }
 }
