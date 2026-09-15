@@ -280,10 +280,22 @@ html.grok-background-active .sand-input-area {
   background-color: transparent !important;
   box-shadow: none !important;
 }
+html.grok-background-active .sand-chat-input-dock > div,
+html.grok-background-active .sand-input-area > div,
+html.grok-background-active .sand-input-area > div > div:not(.sand-kit-message-input-frame) {
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
 html.grok-background-active .sand-kit-message-input-frame {
   background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-composer-opacity) * 28%), transparent) !important;
   background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-composer-opacity) * 28%), transparent) !important;
   box-shadow: none !important;
+}
+html.grok-background-active .sand-kit-message-input-frame .sand-prompt-field,
+html.grok-background-active .sand-kit-message-input-frame [contenteditable="true"] {
+  background: transparent !important;
+  background-color: transparent !important;
 }
 /* 右侧 Agent Computer 的 webview/iframe 保持自身画面，不把聊天背景规则传进去。 */
 html.grok-background-active #sand-conversation-details iframe,
