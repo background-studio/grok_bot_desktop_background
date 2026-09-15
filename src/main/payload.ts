@@ -273,6 +273,18 @@ html.grok-background-active .sand-agent-item:focus-visible {
   background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 100%), transparent) !important;
   background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 100%), transparent) !important;
 }
+html.grok-background-active .sand-chat-stage,
+html.grok-background-active .sand-chat-input-dock,
+html.grok-background-active .sand-input-area {
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
+html.grok-background-active .sand-kit-message-input-frame {
+  background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-composer-opacity) * 28%), transparent) !important;
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-composer-opacity) * 28%), transparent) !important;
+  box-shadow: none !important;
+}
 /* 右侧 Agent Computer 的 webview/iframe 保持自身画面，不把聊天背景规则传进去。 */
 html.grok-background-active #sand-conversation-details iframe,
 html.grok-background-active #sand-conversation-details webview {
