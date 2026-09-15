@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-electron/
+release/
+.vite/
+*.log
+/reference/
+src-tauri/target/
+tools/
+poc/
+.grok-asar/
+.grok-test.png
+build/
+
