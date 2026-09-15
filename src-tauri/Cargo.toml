@@ -1,6 +1,6 @@
 [package]
 name = "grok-background-studio"
-version = "0.3.1"
+version = "0.3.2"
 description = "A headless Background Studio worker for the Grok Windows desktop app."
 authors = ["Grok Background Studio contributors"]
 license = "MIT"

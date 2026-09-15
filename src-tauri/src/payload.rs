@@ -103,6 +103,7 @@ pub fn build_active_payload_from_bytes(
         revision.as_bytes(),
         generated::BACKGROUND_CSS.as_bytes(),
         generated::REVIEW_SHADOW_CSS.as_bytes(),
+        generated::PAYLOAD_TEMPLATE.as_bytes(),
     ]);
     let sentinel_literal =
         serde_json::to_string(MEDIA_URL_SENTINEL).map_err(|error| error.to_string())?;
@@ -121,8 +122,7 @@ pub fn build_active_payload_from_bytes(
     } else {
         None
     };
-    // 小媒体直接复用 data URL，避免 Grok Bot 的 file:// renderer 对 blob:file URL
-    // 解码失败；大媒体仍通过受限分块上传并使用 Blob URL。
+    // 小媒体可以直接使用 data URL；大媒体仍通过受限分块上传并使用 Blob URL。
     let script = early_script
         .clone()
         .unwrap_or_else(|| inline_script.replacen(&sentinel_literal, &pending_expression, 1));

@@ -248,6 +248,31 @@ html.grok-background-active [role="textbox"] {
   background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-composer-opacity) * 28%), transparent) !important;
   background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-composer-opacity) * 28%), transparent) !important;
 }
+/* Grok 0.51 的 sand-shell DOM：这些是 CDP 实测的结构入口，避免依赖会变的哈希类名。 */
+html.grok-background-active .sand-shell,
+html.grok-background-active .sand-agents-sidebar,
+html.grok-background-active .sand-info-pane__inner,
+html.grok-background-active .sand-chat,
+html.grok-background-active .ui-scroll-area__viewport {
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
+html.grok-background-active .sand-agent-item,
+html.grok-background-active .sand-message {
+  background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-card-opacity) * 100%), transparent) !important;
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-card-opacity) * 100%), transparent) !important;
+  box-shadow: none !important;
+}
+html.grok-background-active .sand-agents-sidebar {
+  background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 28%), transparent) !important;
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 28%), transparent) !important;
+}
+html.grok-background-active .sand-agent-item:hover,
+html.grok-background-active .sand-agent-item:focus-visible {
+  background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 100%), transparent) !important;
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 100%), transparent) !important;
+}
 /* 右侧 Agent Computer 的 webview/iframe 保持自身画面，不把聊天背景规则传进去。 */
 html.grok-background-active #sand-conversation-details iframe,
 html.grok-background-active #sand-conversation-details webview {
@@ -307,20 +332,20 @@ export function buildRendererPayload(input: PayloadInput) {
     ];
 
     const previous = window[STATE];
-    if (previous?.cleanup) {
-      previous.cleanup();
-    } else {
+    try { previous?.cleanup?.(); } catch { /* 清理旧版本残留后继续安装新版本。 */ }
+    {
       if (previous?.observer) previous.observer.disconnect();
       if (previous?.timer) clearInterval(previous.timer);
       previous?.wco?.removeEventListener?.("geometrychange", previous?.wcoGeometry);
       previous?.layer?.remove();
       if (previous?.blobUrl?.startsWith?.("blob:")) URL.revokeObjectURL(previous.blobUrl);
+      document.getElementById(LAYER_ID)?.remove();
+      document.getElementById(STYLE_ID)?.remove();
     }
     let scheduled = null;
     let shadowPatch = null;
 
-    // 小媒体的 early payload 已经是可直接解码的 data URL；保持原值可避免
-    // Grok renderer 沙箱对 file:// 页面创建的 blob URL 拒绝解码。
+    // early payload 的 data URL 与完整 payload 的 Blob URL 都可直接给媒体节点使用。
     const blobUrl = config.mediaUrl;
 
     const installReviewShadowStyle = (host, shadow = host?.shadowRoot) => {
@@ -360,7 +385,7 @@ export function buildRendererPayload(input: PayloadInput) {
       if (state?.timer) clearInterval(state.timer);
       state?.wco?.removeEventListener?.("geometrychange", state?.wcoGeometry);
       if (scheduled) cancelAnimationFrame(scheduled);
-      if (shadowPatch?.prototype.attachShadow === shadowPatch.wrapped) {
+      if (shadowPatch && shadowPatch.prototype.attachShadow === shadowPatch.wrapped) {
         shadowPatch.prototype.attachShadow = shadowPatch.original;
       }
       document.getElementById(LAYER_ID)?.remove();
