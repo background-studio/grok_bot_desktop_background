@@ -13,6 +13,15 @@ fn extract_raw(source: &str, marker: &str) -> String {
 }
 
 fn main() {
+    #[cfg(windows)]
+    {
+        println!("cargo:rerun-if-changed=icons/icon.ico");
+        winresource::WindowsResource::new()
+            .set_icon("icons/icon.ico")
+            .compile()
+            .expect("compile Grok Bot plugin icon resource");
+    }
+
     let payload_path = PathBuf::from("../src/main/payload.ts");
     println!("cargo:rerun-if-changed={}", payload_path.display());
     let source = fs::read_to_string(&payload_path).expect("read shared TypeScript payload");

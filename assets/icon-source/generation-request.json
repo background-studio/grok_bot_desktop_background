@@ -1,0 +1,9 @@
+{
+  "model": "gpt-image-2.5-flare",
+  "size": "1024x1024",
+  "quality": "high",
+  "background": "transparent",
+  "output_format": "png",
+  "n": 1,
+  "prompt": "Create ONLY an isolated foreground logo for Grok Bot Background Studio, a genuine transparent-alpha PNG, square 1024x1024. This mark will later be composited over a user-provided photo by code. Absolutely NO background artwork, NO app tile, NO rounded square frame, NO checkerboard, NO text or letters, NO bot face. Design a recognizable Grok-style emblem: a bold open circular orbital ring pierced by a single confident diagonal slash ascending from lower left to upper right. The ring has a clean deliberate opening on the upper right; the slash extends slightly beyond the ring, suggesting the Grok broken-circle/comet symbol. Not the OpenAI knot. Front-facing, vector-sharp silhouette, elegant balanced proportions, thick substantial strokes readable at 24 pixels. Ice-white #EFFAFF upper surfaces grading very subtly to pale ice blue #C1E8FA on the lower portion, fine crisp cyan #68D7EF outlines and an extremely restrained dark teal edge. No chrome, no bevel extravagance, no glow cloud, no decorative stars. Center the isolated emblem within 76 percent of the canvas width and height, generous transparent margins. The hollow center, openings and every area outside the symbol must be genuinely transparent. Match a cohesive desktop icon family characterized by large ice-white technology emblems edged in cyan; create only the foreground emblem, not a finished app icon."
+}
