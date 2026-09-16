@@ -381,14 +381,14 @@ impl Drop for CdpSession {
     }
 }
 
-pub fn window_controls_overlay_visible(port: u16, browser_id: &str) -> Result<bool, String> {
+pub fn native_titlebar_bridge_ready(port: u16, browser_id: &str) -> Result<bool, String> {
     let target = list_targets(port, browser_id)?
         .into_iter()
         .next()
         .ok_or_else(|| "Grok 主页面尚未创建。".to_string())?;
     let session = CdpSession::open(&target, port)?;
     Ok(session
-        .evaluate("Boolean(navigator.windowControlsOverlay?.visible)")?
+        .evaluate("Boolean(navigator.windowControlsOverlay && window.__GROK_BACKGROUND_NATIVE_TITLEBAR__ === true)")?
         .as_bool()
         .unwrap_or(false))
 }

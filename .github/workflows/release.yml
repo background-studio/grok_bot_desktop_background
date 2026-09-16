@@ -33,6 +33,14 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
+      - name: Set up Node for titlebar tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Test native titlebar lifecycle
+        run: node --test src/main/native-titlebar.test.cjs
+
       - name: Verify tag and crate versions
         shell: pwsh
         run: |

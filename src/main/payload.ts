@@ -238,6 +238,20 @@ html.grok-background-active #sand-conversation-details {
   background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
   box-shadow: none !important;
 }
+/* 右侧表单跟随卡片底色；只改背景，保留文字、边框和官方聚焦提示。 */
+html.grok-background-active :is(.sand-info-pane, #sand-conversation-details) :is(
+  input:not([type]),
+  input[type="text"],
+  input[type="search"],
+  input[type="email"],
+  input[type="url"],
+  input[type="tel"],
+  input[type="password"],
+  input[type="number"],
+  textarea
+) {
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-card-opacity) * 100%), transparent) !important;
+}
 html.grok-background-active [role="complementary"] button:hover,
 html.grok-background-active [role="complementary"] button:focus-visible {
   background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 100%), transparent) !important;

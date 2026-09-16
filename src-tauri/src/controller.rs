@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
 
 use crate::{
-    injector::{read_browser_identity, InjectorEngine},
+    electron_wco::launch_with_transparent_wco,
+    injector::{native_titlebar_bridge_ready, read_browser_identity, InjectorEngine},
     managed_launch::{
         snapshot_executable_processes, Observation, ProcessRecord, WatcherAction, MSG_AUTO_APPLIED,
         MSG_DEBUG_TIMEOUT, MSG_EXISTING, MSG_SUSPENDED, MSG_TAKING_OVER, MSG_WAITING,
@@ -206,8 +207,7 @@ fn is_disconnected_error(error: &str) -> bool {
 }
 
 fn session_has_wco(port: u16, browser_id: &str) -> bool {
-    let _ = (port, browser_id);
-    true
+    native_titlebar_bridge_ready(port, browser_id).unwrap_or(false)
 }
 
 fn stop_verified_grok(install: &GrokInstall) -> Result<(), String> {
@@ -470,8 +470,8 @@ impl GrokController {
         if state.package_full_name != install.package_full_name
             || !state.wco_enabled
             || normalized_path(&state.executable) != normalized_path(&install.executable)
-            || read_browser_identity(state.port).ok().as_deref() != Some(&state.browser_id)
             || read_browser_identity(state.port).ok().as_deref() != Some(state.browser_id.as_str())
+            || !session_has_wco(state.port, &state.browser_id)
         {
             return false;
         }
@@ -552,6 +552,9 @@ impl GrokController {
                 let Ok(browser_id) = read_browser_identity(port) else {
                     continue;
                 };
+                if !session_has_wco(port, &browser_id) {
+                    continue;
+                }
                 self.write_state(Some(RuntimeState {
                     schema_version: RUNTIME_SCHEMA_VERSION,
                     port,
@@ -577,21 +580,7 @@ impl GrokController {
                 stop_verified_grok(&install)?;
             }
             let port = select_port(PREFERRED_DEBUG_PORT)?;
-            let arguments = vec![
-                format!("--remote-debugging-port={port}"),
-                "--remote-debugging-address=127.0.0.1".to_string(),
-            ];
-            launch_grok(&install, &arguments)?;
-            let deadline = Instant::now() + Duration::from_secs(45);
-            let browser_id = loop {
-                if let Ok(id) = read_browser_identity(port) {
-                    break id;
-                }
-                if Instant::now() >= deadline {
-                    return Err("Grok Bot 调试会话未在 45 秒内就绪。".to_string());
-                }
-                thread::sleep(Duration::from_millis(300));
-            };
+            let browser_id = launch_with_transparent_wco(Path::new(&install.executable), port)?;
             self.write_state(Some(RuntimeState {
                 schema_version: RUNTIME_SCHEMA_VERSION,
                 port,
@@ -677,8 +666,12 @@ mod tests {
 
     #[test]
     fn selects_an_available_loopback_port() {
-        let port = select_port(39_000).expect("available test port");
-        assert!((39_000..=39_100).contains(&port));
+        // Let Windows choose outside its reserved port ranges.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("allocate test port");
+        let preferred_port = listener.local_addr().expect("test listener address").port();
+        drop(listener);
+        let port = select_port(preferred_port).expect("available test port");
+        assert!((preferred_port..=preferred_port.saturating_add(100)).contains(&port));
     }
 
     #[test]

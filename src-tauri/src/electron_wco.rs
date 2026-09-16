@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     net::{TcpListener, TcpStream},
     os::windows::process::CommandExt,
     path::Path,
@@ -13,51 +12,20 @@ use serde_json::{json, Value};
 use tungstenite::{connect, stream::MaybeTlsStream, Message, WebSocket};
 use url::Url;
 
-use crate::injector::{read_browser_identity, window_controls_overlay_visible};
+use crate::injector::{native_titlebar_bridge_ready, read_browser_identity};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const PREFERRED_INSPECTOR_PORT: u16 = 9238;
 const INSPECTOR_WAIT: Duration = Duration::from_secs(15);
 const RENDERER_WAIT: Duration = Duration::from_secs(45);
 
-const WCO_PATCH: &str = r##"(() => {
-  const originalElectron = electron;
-  const Original = originalElectron.BrowserWindow;
-  if (typeof Original !== "function") {
-    throw new Error("Electron BrowserWindow is unavailable");
-  }
-  const Patched = new Proxy(Original, {
-    construct(target, args) {
-      const options = { ...(args[0] || {}) };
-      options.titleBarStyle = "hidden";
-      options.titleBarOverlay = {
-        color: "rgba(0, 0, 0, 0)",
-        symbolColor: "#ffffff",
-        height: 48
-      };
-      args[0] = options;
-      return Reflect.construct(target, args, target);
-    }
-  });
-  electron = new Proxy(originalElectron, {
-    get(target, property, receiver) {
-      if (property === "BrowserWindow") return Patched;
-      return Reflect.get(target, property, receiver);
-    }
-  });
-  globalThis.__GROK_BACKGROUND_WCO_PATCHED__ = true;
-  return {
-    patched: electron.BrowserWindow === Patched,
-    originalName: Original.name
-  };
-})()"##;
+const WCO_PATCH: &str = include_str!("../../src/main/native-titlebar.cjs");
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InspectorTarget {
     #[serde(rename = "type")]
     target_type: String,
-    title: String,
     web_socket_debugger_url: String,
 }
 
@@ -66,7 +34,6 @@ type InspectorSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 struct InspectorSession {
     socket: InspectorSocket,
     next_id: u64,
-    events: VecDeque<Value>,
 }
 
 impl InspectorSession {
@@ -81,11 +48,7 @@ impl InspectorSession {
                 .set_write_timeout(Some(Duration::from_secs(10)))
                 .map_err(|error| error.to_string())?;
         }
-        Ok(Self {
-            socket,
-            next_id: 1,
-            events: VecDeque::new(),
-        })
+        Ok(Self { socket, next_id: 1 })
     }
 
     fn command(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -100,10 +63,6 @@ impl InspectorSession {
             .map_err(|error| error.to_string())?;
         loop {
             let value = self.read_value()?;
-            if value.get("method").is_some() && value.get("id").is_none() {
-                self.events.push_back(value);
-                continue;
-            }
             if value.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
@@ -114,52 +73,13 @@ impl InspectorSession {
         }
     }
 
-    fn wait_event(&mut self, method: &str) -> Result<Value, String> {
-        if let Some(index) = self
-            .events
-            .iter()
-            .position(|event| event.get("method").and_then(Value::as_str) == Some(method))
-        {
-            return Ok(self.events.remove(index).unwrap_or(Value::Null));
-        }
-        loop {
-            let value = self.read_value()?;
-            if value.get("method").and_then(Value::as_str) == Some(method) {
-                return Ok(value);
-            }
-            if value.get("method").is_some() && value.get("id").is_none() {
-                self.events.push_back(value);
-            }
-        }
-    }
-
-    fn evaluate_on_frame(
-        &mut self,
-        call_frame_id: &str,
-        expression: &str,
-    ) -> Result<Value, String> {
-        let result = self.command(
-            "Debugger.evaluateOnCallFrame",
-            json!({
-                "callFrameId": call_frame_id,
-                "expression": expression,
-                "returnByValue": true
-            }),
-        )?;
-        ensure_no_exception(&result)?;
-        Ok(result
-            .pointer("/result/value")
-            .cloned()
-            .unwrap_or(Value::Null))
-    }
-
     fn evaluate(&mut self, expression: &str) -> Result<Value, String> {
         let result = self.command(
             "Runtime.evaluate",
             json!({
                 "expression": expression,
                 "returnByValue": true,
-                "awaitPromise": true
+                "awaitPromise": false
             }),
         )?;
         ensure_no_exception(&result)?;
@@ -268,7 +188,6 @@ fn wait_for_inspector(port: u16) -> Result<InspectorTarget, String> {
             Ok(targets) => {
                 if let Some(target) = targets.into_iter().find(|target| {
                     target.target_type == "node"
-                        && target.title.starts_with("electron/")
                         && validate_inspector_websocket(&target.web_socket_debugger_url, port)
                             .is_ok()
                 }) {
@@ -294,39 +213,6 @@ fn select_inspector_port(renderer_port: u16) -> Result<u16, String> {
         }
     }
     Err("无法为 Grok 分配主进程 Inspector 端口。".to_string())
-}
-
-fn patch_line(source: &str) -> Result<usize, String> {
-    let lines = source.lines().collect::<Vec<_>>();
-    let electron_line = lines
-        .iter()
-        .position(|line| line.contains("let electron = require(\"electron\")"))
-        .ok_or_else(|| "Grok 主进程入口缺少预期的 Electron import。".to_string())?;
-    lines
-        .iter()
-        .enumerate()
-        .skip(electron_line + 1)
-        .find_map(|(index, line)| line.starts_with("//#region src/").then_some(index))
-        .ok_or_else(|| "无法定位 Grok 主进程 import 结束位置。".to_string())
-}
-
-fn first_call_frame(event: &Value) -> Result<(&str, &str, u64), String> {
-    let frame = event
-        .pointer("/params/callFrames/0")
-        .ok_or_else(|| "Electron Inspector 暂停事件缺少调用帧。".to_string())?;
-    let id = frame
-        .get("callFrameId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Electron Inspector 调用帧 ID 无效。".to_string())?;
-    let script_id = frame
-        .pointer("/location/scriptId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Electron Inspector script ID 无效。".to_string())?;
-    let line = frame
-        .pointer("/location/lineNumber")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    Ok((id, script_id, line))
 }
 
 fn schedule_inspector_close(session: &mut InspectorSession) -> Result<(), String> {
@@ -366,12 +252,11 @@ pub fn launch_with_transparent_wco(
         return Err("Grok 可执行文件不存在。".to_string());
     }
     let inspector_port = select_inspector_port(renderer_port)?;
-    Command::new(executable)
+    let mut child = Command::new(executable)
         .args([
             "--remote-debugging-address=127.0.0.1".to_string(),
             format!("--remote-debugging-port={renderer_port}"),
-            "--remote-allow-origins=*".to_string(),
-            format!("--inspect-brk=127.0.0.1:{inspector_port}"),
+            format!("--inspect=127.0.0.1:{inspector_port}"),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -380,55 +265,25 @@ pub fn launch_with_transparent_wco(
         .spawn()
         .map_err(|error| format!("启动 Grok 失败：{error}"))?;
 
-    let target = wait_for_inspector(inspector_port)?;
-    let mut session = InspectorSession::open(&target, inspector_port)?;
     let result = (|| {
+        let target = wait_for_inspector(inspector_port)?;
+        let mut session = InspectorSession::open(&target, inspector_port)?;
         session.command("Runtime.enable", json!({}))?;
-        session.command("Debugger.enable", json!({}))?;
-        session.command("Runtime.runIfWaitingForDebugger", json!({}))?;
-
-        // --inspect-brk first pauses at the first line of the actual main bundle.
-        let first_pause = session.wait_event("Debugger.paused")?;
-        let (_, script_id, _) = first_call_frame(&first_pause)?;
-        let source = session
-            .command("Debugger.getScriptSource", json!({ "scriptId": script_id }))?
-            .get("scriptSource")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| "无法读取 Grok 主进程入口脚本。".to_string())?;
-        if !source.contains("titleBarStyle: \"hiddenInset\"")
-            || !source.contains("new electron.BrowserWindow")
+        let identity = session.evaluate("({ pid: process.pid, type: process.type })")?;
+        if identity["pid"].as_u64() != Some(u64::from(child.id()))
+            || identity["type"].as_str() != Some("browser")
         {
-            return Err("Grok 主进程窗口结构已变化，拒绝应用透明标题栏补丁。".to_string());
+            return Err("Grok 主进程 Inspector 身份与本次启动的进程不一致。".to_string());
         }
-        let line = patch_line(&source)?;
-        session.command(
-            "Debugger.setBreakpoint",
-            json!({
-                "location": {
-                    "scriptId": script_id,
-                    "lineNumber": line,
-                    "columnNumber": 0
-                }
-            }),
-        )?;
-        session.command("Debugger.resume", json!({}))?;
-
-        let import_pause = session.wait_event("Debugger.paused")?;
-        let (call_frame_id, _, paused_line) = first_call_frame(&import_pause)?;
-        if paused_line < line as u64 {
-            return Err("Electron 主进程未在预期的 import 结束位置暂停。".to_string());
+        let patch = session.evaluate(WCO_PATCH)?;
+        if patch.get("installed").and_then(Value::as_bool) != Some(true) {
+            return Err("Electron 原生标题栏透明补丁未成功安装。".to_string());
         }
-        let patch = session.evaluate_on_frame(call_frame_id, WCO_PATCH)?;
-        if patch.get("patched").and_then(Value::as_bool) != Some(true) {
-            return Err("Electron BrowserWindow 代理未成功安装。".to_string());
-        }
-        session.command("Debugger.resume", json!({}))?;
 
         let deadline = Instant::now() + RENDERER_WAIT;
         let browser_id = loop {
             if let Ok(browser_id) = read_browser_identity(renderer_port) {
-                if window_controls_overlay_visible(renderer_port, &browser_id).unwrap_or(false) {
+                if native_titlebar_bridge_ready(renderer_port, &browser_id).unwrap_or(false) {
                     break browser_id;
                 }
             }
@@ -439,17 +294,15 @@ pub fn launch_with_transparent_wco(
         };
 
         schedule_inspector_close(&mut session)?;
+        drop(session);
+        wait_for_inspector_close(inspector_port)?;
         Ok(browser_id)
     })();
 
     if result.is_err() {
-        // Never leave Grok suspended at a debugger pause.
-        let _ = session.command("Runtime.runIfWaitingForDebugger", json!({}));
-        let _ = session.command("Debugger.resume", json!({}));
-    }
-    drop(session);
-    if result.is_ok() {
-        wait_for_inspector_close(inspector_port)?;
+        // Do not leave a privileged Inspector listener behind after a failed launch.
+        let _ = child.kill();
+        let _ = child.wait();
     }
     result
 }
@@ -473,25 +326,5 @@ mod tests {
         ] {
             assert!(validate_inspector_websocket(url, 9238).is_err());
         }
-    }
-
-    #[test]
-    fn finds_import_boundary_in_rolldown_bundle() {
-        let source = r#"//#region \0rolldown/runtime.js
-var helper = true;
-//#endregion
-let electron = require("electron");
-let path = require("path");
-//#region src/main/example.ts
-const value = 1;"#;
-        assert_eq!(patch_line(source).unwrap(), 5);
-    }
-
-    #[test]
-    fn patch_enables_transparent_native_controls() {
-        assert!(WCO_PATCH.contains("titleBarStyle = \"hidden\""));
-        assert!(WCO_PATCH.contains("rgba(0, 0, 0, 0)"));
-        assert!(WCO_PATCH.contains("symbolColor: \"#ffffff\""));
-        assert!(WCO_PATCH.contains("height: 48"));
     }
 }
