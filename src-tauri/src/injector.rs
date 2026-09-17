@@ -15,7 +15,10 @@ use serde_json::{json, Value};
 use tungstenite::{connect, stream::MaybeTlsStream, Message, WebSocket};
 use url::Url;
 
-use crate::payload::{ActivePayload, PENDING_MEDIA_URL_KEY};
+use crate::{
+    models::MediaKind,
+    payload::{ActivePayload, PENDING_MEDIA_URL_KEY},
+};
 
 const MEDIA_CHUNK_BYTES: usize = 192 * 1024;
 const PENDING_MEDIA_PARTS_KEY: &str = "__BACKGROUND_STUDIO_PENDING_MEDIA_PARTS__";
@@ -362,14 +365,26 @@ fn upload_media(session: &CdpSession, payload: &ActivePayload) -> Result<(), Str
     for chunk in payload.media_bytes.chunks(MEDIA_CHUNK_BYTES) {
         let encoded =
             serde_json::to_string(&STANDARD.encode(chunk)).map_err(|error| error.to_string())?;
-        session.evaluate(&format!(
-            "(()=>{{const binary=atob({encoded});const bytes=new Uint8Array(binary.length);for(let i=0;i<binary.length;i+=1)bytes[i]=binary.charCodeAt(i);window[{parts_key}].push(bytes);return bytes.length;}})()"
-        ))?;
+        let expression = match payload.media_kind {
+            MediaKind::Image => format!(
+                "(()=>{{window[{parts_key}].push({encoded});return true;}})()"
+            ),
+            MediaKind::Video => format!(
+                "(()=>{{const binary=atob({encoded});const bytes=new Uint8Array(binary.length);for(let index=0;index<binary.length;index+=1)bytes[index]=binary.charCodeAt(index);window[{parts_key}].push(bytes);return bytes.length;}})()"
+            ),
+        };
+        session.evaluate(&expression)?;
     }
     let mime =
         serde_json::to_string(&payload.media_mime_type).map_err(|error| error.to_string())?;
+    // Grok's img-src allows data: but blocks blob:, while media-src allows blob:.
+    // Chunk size is divisible by three so concatenated base64 has no interior padding.
+    let source_expression = match payload.media_kind {
+        MediaKind::Image => format!("'data:'+{mime}+';base64,'+parts.join('')"),
+        MediaKind::Video => format!("URL.createObjectURL(new Blob(parts,{{type:{mime}}}))"),
+    };
     session.evaluate(&format!(
-        "(()=>{{const parts=window[{parts_key}];if(!Array.isArray(parts))throw new Error('背景媒体分块状态丢失');window[{url_key}]=URL.createObjectURL(new Blob(parts,{{type:{mime}}}));delete window[{parts_key}];return window[{url_key}];}})()"
+        "(()=>{{const parts=window[{parts_key}];if(!Array.isArray(parts))throw new Error('背景媒体分块状态丢失');window[{url_key}]={source_expression};delete window[{parts_key}];return true;}})()"
     ))?;
     Ok(())
 }
@@ -413,8 +428,8 @@ fn early_payload_for(payload: &str, revision: &str) -> String {
         r#"(() => {{
   const revision = {safe_revision};
   const run = () => {{
-    if (!document.documentElement) return false;
-    try {{ {payload}; return true; }} catch {{ return false; }}
+    if (document.documentElement?.tagName !== "HTML" || !document.body) return false;
+    try {{ Promise.resolve({payload}).catch(() => {{}}); return true; }} catch {{ return false; }}
   }};
   if (!run()) {{
     const observer = new MutationObserver(() => {{
@@ -440,18 +455,39 @@ fn remove_from_session(managed: &mut ManagedSession) {
 }
 
 const EARLY_TRANSPARENCY_SCRIPT: &str = r#"(() => {
-  try {
+  const install = () => {
+    const root = document.documentElement;
+    // A style appended to Document before HTML exists becomes its root element.
+    if (root?.tagName !== "HTML") return false;
+    if (document.getElementById("grok-background-early-transparency")) return true;
     const style = document.createElement("style");
     style.id = "grok-background-early-transparency";
     style.textContent = "html,body,#root,.sand-shell,.sand-agents-sidebar,.sand-chat,.sand-chat-stage,.sand-chat-input-dock,.sand-input-area,.sand-kit-message-input-frame,.sand-info-pane__inner,.ui-scroll-area__viewport,.bg-app-shell,[data-slot=sidebar-wrapper],[data-sidebar=sidebar],[data-slot=sidebar-inner],[data-sidebar=menu-button][data-active],[data-sidebar=menu-button]:hover,[data-sidebar=menu-button]:focus-visible,.bg-page-canvas,.bg-page-canvas .bg-background,.bg-card,header,[role=button][aria-roledescription=sortable]>a[href*='/issues/']>[class~=bg-surface]{background:transparent!important;background-color:transparent!important}";
-    (document.documentElement || document).appendChild(style);
-  } catch {}
+    root.appendChild(style);
+    return true;
+  };
+  if (!install()) {
+    const observer = new MutationObserver(() => {
+      if (install()) observer.disconnect();
+    });
+    observer.observe(document, { childList: true, subtree: true });
+    setTimeout(() => observer.disconnect(), 30000);
+  }
 })()"#;
 
 fn apply_to_session(managed: &mut ManagedSession, payload: &ActivePayload) -> Result<(), String> {
     let revision = &payload.revision;
     if managed.revision.as_deref() == Some(revision) {
-        return Ok(());
+        let serialized_revision =
+            serde_json::to_string(revision).map_err(|error| error.to_string())?;
+        let installed = managed.session.evaluate(&format!(
+            "(()=>{{const state=window.__GROK_BACKGROUND_STUDIO__;const media=document.getElementById('grok-background-media');return state?.revision==={serialized_revision}&&document.documentElement.classList.contains('grok-background-active')&&Boolean(media&&(media.tagName==='VIDEO'?media.readyState>=2:media.complete&&media.naturalWidth>0));}})()"
+        ))?;
+        if installed.as_bool() == Some(true) {
+            return Ok(());
+        }
+        // Reload keeps the CDP target alive but destroys its document and Blob URLs.
+        managed.revision = None;
     }
     if let Some(identifier) = managed.early_script_id.take() {
         let _ = managed.session.send(
@@ -459,9 +495,6 @@ fn apply_to_session(managed: &mut ManagedSession, payload: &ActivePayload) -> Re
             json!({ "identifier": identifier }),
         );
     }
-    managed
-        .session
-        .send("Page.setBypassCSP", json!({ "enabled": true }))?;
     let early_source = payload
         .early_script
         .as_deref()
@@ -475,9 +508,17 @@ fn apply_to_session(managed: &mut ManagedSession, payload: &ActivePayload) -> Re
         .get("identifier")
         .and_then(Value::as_str)
         .map(str::to_string);
-    if let Err(error) = upload_media(&managed.session, payload)
-        .and_then(|_| managed.session.evaluate(&payload.script).map(|_| ()))
-    {
+    let result = (|| {
+        if payload.early_script.is_none() {
+            upload_media(&managed.session, payload)?;
+        }
+        let installed = managed.session.evaluate(&payload.script)?;
+        if installed.get("installed").and_then(Value::as_bool) != Some(true) {
+            return Err("Grok background media was not installed".to_string());
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
         eprintln!("Grok Bot CDP 注入失败: {error}");
         clear_pending_media(&managed.session, true);
         return Err(error);
@@ -487,14 +528,16 @@ fn apply_to_session(managed: &mut ManagedSession, payload: &ActivePayload) -> Re
     Ok(())
 }
 
-fn sync_inner(inner: &Arc<Mutex<InjectorInner>>, target_count: &AtomicUsize, force: bool) {
-    let Ok(mut inner) = inner.lock() else {
-        return;
-    };
-    let Ok(targets) = list_targets(inner.port, &inner.browser_id) else {
-        target_count.store(inner.sessions.len(), Ordering::Relaxed);
-        return;
-    };
+fn sync_inner(
+    inner: &Arc<Mutex<InjectorInner>>,
+    target_count: &AtomicUsize,
+    force: bool,
+) -> Result<(), String> {
+    let mut inner = inner
+        .lock()
+        .map_err(|_| "CDP injection lock was poisoned".to_string())?;
+    let targets = list_targets(inner.port, &inner.browser_id)?;
+    let mut first_error = None;
     let target_ids = targets
         .iter()
         .map(|target| target.id.as_str())
@@ -510,7 +553,7 @@ fn sync_inner(inner: &Arc<Mutex<InjectorInner>>, target_count: &AtomicUsize, for
             continue;
         };
         let probe = session
-            .evaluate("Boolean(document.documentElement)")
+            .evaluate("document.documentElement?.tagName === 'HTML' && Boolean(document.body)")
             .ok()
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
@@ -534,11 +577,16 @@ fn sync_inner(inner: &Arc<Mutex<InjectorInner>>, target_count: &AtomicUsize, for
                 }
                 if let Err(error) = apply_to_session(managed, &payload) {
                     eprintln!("CDP 注入失败: {error}");
+                    first_error.get_or_insert(error);
                 }
             }
         }
     }
     target_count.store(inner.sessions.len(), Ordering::Relaxed);
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 pub struct InjectorEngine {
@@ -573,7 +621,7 @@ impl InjectorEngine {
             inner.payload = Some(payload);
             inner.paused = false;
         }
-        sync_inner(&self.inner, &self.target_count, false);
+        sync_inner(&self.inner, &self.target_count, false)?;
         if self.thread.is_none() {
             let inner = Arc::clone(&self.inner);
             let count = Arc::clone(&self.target_count);
@@ -585,7 +633,7 @@ impl InjectorEngine {
                         while !stopping.load(Ordering::Relaxed) {
                             thread::sleep(Duration::from_millis(1200));
                             if !stopping.load(Ordering::Relaxed) {
-                                sync_inner(&inner, &count, false);
+                                let _ = sync_inner(&inner, &count, false);
                             }
                         }
                     })
@@ -604,8 +652,7 @@ impl InjectorEngine {
             inner.payload = Some(payload);
             inner.paused = false;
         }
-        sync_inner(&self.inner, &self.target_count, true);
-        Ok(())
+        sync_inner(&self.inner, &self.target_count, true)
     }
 
     pub fn pause(&self) -> Result<(), String> {

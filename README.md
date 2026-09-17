@@ -21,7 +21,7 @@ Grok Bot 的右侧 Agent Computer 是独立 `webview`，插件只接管 `file://
 ```powershell
 cargo fmt --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
-node --test src/main/native-titlebar.test.cjs
+node --test src/main/native-titlebar.test.cjs src/main/early-transparency.test.cjs
 cargo build --release --manifest-path src-tauri/Cargo.toml
 ```
 

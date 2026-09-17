@@ -40,6 +40,7 @@ pub struct ActivePayload {
     pub revision: String,
     pub media_bytes: Arc<[u8]>,
     pub media_mime_type: String,
+    pub media_kind: MediaKind,
     pub early_script: Option<String>,
 }
 
@@ -115,14 +116,15 @@ pub fn build_active_payload_from_bytes(
     if !inline_script.contains(&sentinel_literal) {
         return Err("背景媒体占位符生成失败。".to_string());
     }
-    let early_script = if bytes.len() <= MAX_EARLY_INLINE_MEDIA_BYTES {
+    // Grok permits data: images but only blob: videos in its renderer CSP.
+    let early_script = if *kind == MediaKind::Image && bytes.len() <= MAX_EARLY_INLINE_MEDIA_BYTES {
         let media_url = format!("data:{mime_type};base64,{}", STANDARD.encode(&bytes));
         let candidate = render_script(&media_url, kind, display, &payload_revision)?;
         (candidate.len() <= MAX_EARLY_SCRIPT_BYTES).then_some(candidate)
     } else {
         None
     };
-    // 小媒体可以直接使用 data URL；大媒体仍通过受限分块上传并使用 Blob URL。
+    // Large images and all videos use bounded uploads, not oversized CDP commands.
     let script = early_script
         .clone()
         .unwrap_or_else(|| inline_script.replacen(&sentinel_literal, &pending_expression, 1));
@@ -131,6 +133,7 @@ pub fn build_active_payload_from_bytes(
         revision: payload_revision,
         media_bytes: Arc::from(bytes),
         media_mime_type: mime_type.to_string(),
+        media_kind: kind.clone(),
         early_script,
     })
 }
@@ -200,5 +203,20 @@ mod tests {
         assert!(payload.script.len() < MAX_EARLY_SCRIPT_BYTES);
         assert!(!payload.script.contains("data:image/png;base64,"));
         assert!(payload.script.contains(PENDING_MEDIA_URL_KEY));
+    }
+
+    #[test]
+    fn small_videos_do_not_use_csp_blocked_data_urls() {
+        let payload = build_active_payload_from_bytes(
+            vec![0x5a; 1024],
+            &MediaKind::Video,
+            "video/webm",
+            &DisplaySettings::default(),
+        )
+        .unwrap();
+        assert!(payload.early_script.is_none());
+        assert!(payload.script.contains(PENDING_MEDIA_URL_KEY));
+        assert!(!payload.script.contains("data:video/"));
+        assert_eq!(payload.media_kind, MediaKind::Video);
     }
 }

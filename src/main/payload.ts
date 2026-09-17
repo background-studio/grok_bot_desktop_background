@@ -349,7 +349,7 @@ export function buildRendererPayload(input: PayloadInput) {
   const css = JSON.stringify(BACKGROUND_CSS);
   const reviewShadowCss = JSON.stringify(REVIEW_SHADOW_CSS);
   const reviewShadowStyleId = JSON.stringify(REVIEW_SHADOW_STYLE_ID);
-  return String.raw`((config, cssText, reviewShadowCssText, reviewShadowStyleId) => {
+  return String.raw`(async (config, cssText, reviewShadowCssText, reviewShadowStyleId) => {
     const STATE = "__GROK_BACKGROUND_STUDIO__";
     const STYLE_ID = "grok-background-style";
     const LAYER_ID = "grok-background-layer";
@@ -369,6 +369,57 @@ export function buildRendererPayload(input: PayloadInput) {
       "--cbg-wco-safe-right", "--cbg-card-opacity"
     ];
 
+    // New-document scripts can run before the parser has created HTML or BODY.
+    if (document.documentElement?.tagName !== "HTML" || !document.body) {
+      await new Promise((resolve, reject) => {
+        const observer = new MutationObserver(() => {
+          if (document.documentElement?.tagName === "HTML" && document.body) {
+            observer.disconnect();
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+        const timeout = setTimeout(() => {
+          observer.disconnect();
+          reject(new Error("Grok document was not ready for background installation"));
+        }, 15000);
+        observer.observe(document, { childList: true, subtree: true });
+      });
+    }
+
+    // Validate and decode the replacement before removing the visible background.
+    const blobUrl = config.mediaUrl;
+    const preparedMedia = document.createElement(config.mediaKind === "video" ? "video" : "img");
+    preparedMedia.setAttribute("aria-hidden", "true");
+    if (config.mediaKind === "video") {
+      preparedMedia.autoplay = true;
+      preparedMedia.loop = true;
+      preparedMedia.muted = Boolean(config.display.videoMuted);
+      preparedMedia.defaultMuted = Boolean(config.display.videoMuted);
+      preparedMedia.playsInline = true;
+      preparedMedia.preload = "auto";
+      preparedMedia.playbackRate = Number(config.display.videoPlaybackRate) || 1;
+    }
+    await new Promise((resolve, reject) => {
+      const readyEvent = config.mediaKind === "video" ? "loadeddata" : "load";
+      const clearListeners = () => {
+        clearTimeout(timeout);
+        preparedMedia.removeEventListener(readyEvent, onReady);
+        preparedMedia.removeEventListener("error", onError);
+      };
+      const onReady = () => { clearListeners(); resolve(); };
+      const onError = () => {
+        clearListeners();
+        preparedMedia.removeAttribute("src");
+        reject(new Error("Grok background media could not be loaded"));
+      };
+      const timeout = setTimeout(onError, 15000);
+      preparedMedia.addEventListener(readyEvent, onReady, { once: true });
+      preparedMedia.addEventListener("error", onError, { once: true });
+      preparedMedia.src = blobUrl;
+    });
+    if (config.mediaKind === "image") await preparedMedia.decode();
+
     const previous = window[STATE];
     try { previous?.cleanup?.(); } catch { /* 清理旧版本残留后继续安装新版本。 */ }
     {
@@ -382,9 +433,6 @@ export function buildRendererPayload(input: PayloadInput) {
     }
     let scheduled = null;
     let shadowPatch = null;
-
-    // early payload 的 data URL 与完整 payload 的 Blob URL 都可直接给媒体节点使用。
-    const blobUrl = config.mediaUrl;
 
     const installReviewShadowStyle = (host, shadow = host?.shadowRoot) => {
       if (!shadow) return false;
@@ -428,6 +476,7 @@ export function buildRendererPayload(input: PayloadInput) {
       }
       document.getElementById(LAYER_ID)?.remove();
       document.getElementById(STYLE_ID)?.remove();
+      document.getElementById("grok-background-early-transparency")?.remove();
       document.querySelectorAll("diffs-container").forEach((host) => {
         host.shadowRoot?.getElementById(reviewShadowStyleId)?.remove();
       });
@@ -512,19 +561,11 @@ export function buildRendererPayload(input: PayloadInput) {
       if (!layer && document.body) {
         layer = document.createElement("div");
         layer.id = LAYER_ID;
-        const media = document.createElement(config.mediaKind === "video" ? "video" : "img");
+        const media = preparedMedia;
         media.id = "grok-background-media";
-        media.setAttribute("aria-hidden", "true");
-        if (config.mediaKind === "video") {
-          media.autoplay = true;
-          media.loop = true;
-          media.muted = Boolean(config.display.videoMuted);
-          media.defaultMuted = Boolean(config.display.videoMuted);
-          media.playsInline = true;
-          media.playbackRate = Number(config.display.videoPlaybackRate) || 1;
-        }
-        media.src = blobUrl;
-        media.addEventListener("error", () => cleanup());
+        media.addEventListener("error", () => {
+          if (window[STATE]?.cleanup === cleanup) cleanup();
+        }, { once: true });
         const tile = document.createElement("div");
         tile.id = "grok-background-tile";
         const overlay = document.createElement("div");
@@ -591,6 +632,7 @@ export function buildRendererPayload(input: PayloadInput) {
       wco, wcoGeometry,
     };
     install();
+    document.getElementById("grok-background-early-transparency")?.remove();
     window[STATE].layer = document.getElementById(LAYER_ID);
     return { installed: true, revision: config.revision, mediaKind: config.mediaKind };
   })(${serialized}, ${css}, ${reviewShadowCss}, ${reviewShadowStyleId})`;
@@ -617,8 +659,8 @@ export function earlyPayloadFor(payload: string, revision: string) {
   return String.raw`(() => {
     const revision = ${safeRevision};
     const run = () => {
-      if (!document.documentElement) return false;
-      try { ${payload}; return true; } catch { return false; }
+      if (document.documentElement?.tagName !== "HTML" || !document.body) return false;
+      try { Promise.resolve(${payload}).catch(() => undefined); return true; } catch { return false; }
     };
     if (!run()) {
       const observer = new MutationObserver(() => {

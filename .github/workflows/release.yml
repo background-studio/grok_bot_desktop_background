@@ -33,13 +33,13 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
-      - name: Set up Node for titlebar tests
+      - name: Set up Node for renderer lifecycle tests
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
-      - name: Test native titlebar lifecycle
-        run: node --test src/main/native-titlebar.test.cjs
+      - name: Test native titlebar and early injection lifecycle
+        run: node --test src/main/native-titlebar.test.cjs src/main/early-transparency.test.cjs
 
       - name: Verify tag and crate versions
         shell: pwsh
