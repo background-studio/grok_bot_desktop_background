@@ -114,7 +114,7 @@ fn normalized_path(path: &str) -> String {
 }
 
 fn candidate_executables() -> Vec<PathBuf> {
-    vec![PathBuf::from(r"D:\grok_bot\Grok Bot\Grok Bot.exe")]
+    vec![PathBuf::from(crate::fuse_guard::TARGET)]
 }
 
 fn read_version(executable: &Path) -> String {
@@ -215,10 +215,14 @@ fn stop_verified_grok(install: &GrokInstall) -> Result<(), String> {
         r#"
 $ErrorActionPreference = 'Stop'
 $target = {}
+$ProgressPreference = 'SilentlyContinue'
 $processes = @(Get-CimInstance Win32_Process -Filter "Name='Grok Bot.exe'" | Where-Object {{
   $_.ExecutablePath -and [IO.Path]::GetFullPath($_.ExecutablePath).Equals($target, [StringComparison]::OrdinalIgnoreCase)
 }})
 foreach ($item in $processes) {{ Stop-Process -Id ([int]$item.ProcessId) -Force -ErrorAction SilentlyContinue }}
+# Electron children may exit with their parent before the last Stop-Process.
+# The caller independently verifies that all processes actually exited.
+exit 0
 "#,
         powershell_quote(&normalized_path(&install.executable))
     );
@@ -374,6 +378,9 @@ impl GrokController {
     }
 
     pub fn probe_managed(&mut self) -> Result<ManagedProbe, String> {
+        if let Some(error) = crate::fuse_guard::recovery_error() {
+            return Err(error);
+        }
         let install = self.cached_install()?;
         let processes = process_records_for(&install)?;
         let engine_alive = self
@@ -394,7 +401,7 @@ impl GrokController {
     pub fn apply_watcher_action_status(&mut self, action: WatcherAction) {
         match action {
             WatcherAction::Wait => {
-                if !matches!(self.status.phase.as_str(), "active" | "paused") {
+                if !matches!(self.status.phase.as_str(), "active" | "paused" | "error") {
                     self.set_managed_status("idle", MSG_WAITING);
                 }
             }
@@ -634,7 +641,10 @@ impl GrokController {
                 Ok(install) => {
                     if !process_ids_for(&install)?.is_empty() {
                         stop_verified_grok(&install)?;
+                        let _launch_guard = crate::fuse_guard::restore_before_official_launch()?;
                         launch_grok(&install, &[])?;
+                    } else {
+                        crate::fuse_guard::restore_before_official_launch()?;
                     }
                     self.status.grok_version = Some(install.version);
                 }
@@ -684,16 +694,16 @@ mod tests {
     }
 
     #[test]
-    fn wait_and_existing_clear_stale_probe_error() {
+    fn wait_preserves_failure_until_explicit_action_or_new_process() {
         let dir = std::env::temp_dir().join(format!("grok-managed-status-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let mut controller = GrokController::load(&dir);
         controller.set_managed_error("探测失败");
         controller.apply_watcher_action_status(WatcherAction::Wait);
         let status = controller.status();
-        assert_eq!(status.phase, "idle");
-        assert_eq!(status.message, MSG_WAITING);
-        assert!(status.last_error.is_none());
+        assert_eq!(status.phase, "error");
+        assert_eq!(status.message, "探测失败");
+        assert_eq!(status.last_error.as_deref(), Some("探测失败"));
 
         controller.set_managed_error("探测失败");
         controller.apply_watcher_action_status(WatcherAction::ReportExistingUnmanaged);
@@ -708,7 +718,7 @@ mod tests {
     #[ignore = "requires the official Grok desktop installation"]
     fn discovers_installed_grok_and_reads_processes() {
         let install = discover_grok().expect("discover official Grok");
-        assert!(normalized_path(&install.executable).ends_with("\\grok.exe"));
+        assert!(normalized_path(&install.executable).ends_with("\\grok bot.exe"));
         process_ids_for(&install).expect("query verified Grok processes");
         for port in debug_ports_for(&install).expect("query verified Grok debug ports") {
             read_browser_identity(port).expect("verify Grok browser identity");

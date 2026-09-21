@@ -1,5 +1,6 @@
 mod controller;
 mod electron_wco;
+mod fuse_guard;
 mod injector;
 mod managed_launch;
 mod media;
@@ -20,6 +21,10 @@ pub(crate) fn lock<T>(value: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
 }
 
 pub async fn run() -> Result<(), String> {
+    if fuse_guard::is_helper() {
+        return fuse_guard::run_helper();
+    }
+    fuse_guard::resume_recovery()?;
     let state = Arc::new(WorkerState::load()?);
     worker::start_managed_launch_worker(Arc::clone(&state));
     plugin_ipc::start(Arc::clone(&state));

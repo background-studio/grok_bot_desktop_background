@@ -418,7 +418,13 @@ export function buildRendererPayload(input: PayloadInput) {
       preparedMedia.addEventListener("error", onError, { once: true });
       preparedMedia.src = blobUrl;
     });
-    if (config.mediaKind === "image") await preparedMedia.decode();
+    if (config.mediaKind === "image") {
+      // HTMLImageElement.decode() waits for a rendering opportunity and can
+      // hang indefinitely in hidden/minimized Electron windows. ImageBitmap
+      // performs the same decode validation without waiting for a visible frame.
+      const decoded = await createImageBitmap(preparedMedia);
+      decoded.close();
+    }
 
     const previous = window[STATE];
     try { previous?.cleanup?.(); } catch { /* 清理旧版本残留后继续安装新版本。 */ }

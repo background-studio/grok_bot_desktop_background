@@ -208,7 +208,10 @@ impl WorkerState {
         }
         if let Ok(mut controller) = lock(&self.controller) {
             if !controller.watcher_paused()
-                && !matches!(controller.status().phase.as_str(), "active" | "paused")
+                && !matches!(
+                    controller.status().phase.as_str(),
+                    "active" | "paused" | "error"
+                )
             {
                 controller.set_managed_status("idle", crate::managed_launch::MSG_WAITING);
             }

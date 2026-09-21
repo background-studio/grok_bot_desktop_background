@@ -153,6 +153,10 @@ mod tests {
         )
         .unwrap();
         assert!(payload.script.contains("grok-background-layer"));
+        assert!(payload
+            .script
+            .contains("await createImageBitmap(preparedMedia)"));
+        assert!(!payload.script.contains("await preparedMedia.decode()"));
         assert!(payload.script.contains("diffs-container"));
         assert!(payload
             .script

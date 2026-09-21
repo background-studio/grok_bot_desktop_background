@@ -9,7 +9,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tungstenite::{connect, stream::MaybeTlsStream, Message, WebSocket};
+use tungstenite::{client, stream::MaybeTlsStream, Message, WebSocket};
 use url::Url;
 
 use crate::injector::{native_titlebar_bridge_ready, read_browser_identity};
@@ -39,19 +39,28 @@ struct InspectorSession {
 impl InspectorSession {
     fn open(target: &InspectorTarget, port: u16) -> Result<Self, String> {
         let websocket = validate_inspector_websocket(&target.web_socket_debugger_url, port)?;
-        let (mut socket, _) = connect(websocket.as_str()).map_err(|error| error.to_string())?;
-        if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(20)))
-                .map_err(|error| error.to_string())?;
-            stream
-                .set_write_timeout(Some(Duration::from_secs(10)))
-                .map_err(|error| error.to_string())?;
-        }
+        let parsed = Url::parse(&websocket).map_err(|error| error.to_string())?;
+        let address = if matches!(parsed.host_str(), Some("::1" | "[::1]")) {
+            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))
+        } else {
+            std::net::SocketAddr::from(([127, 0, 0, 1], port))
+        };
+        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| error.to_string())?;
+        // Set timeouts BEFORE the HTTP upgrade handshake, not after connect().
+        let (socket, _) = client(websocket.as_str(), MaybeTlsStream::Plain(stream))
+            .map_err(|error| error.to_string())?;
         Ok(Self { socket, next_id: 1 })
     }
 
     fn command(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let deadline = Instant::now() + Duration::from_secs(20);
         let id = self.next_id;
         self.next_id += 1;
         self.socket
@@ -62,7 +71,7 @@ impl InspectorSession {
             ))
             .map_err(|error| error.to_string())?;
         loop {
-            let value = self.read_value()?;
+            let value = self.read_value(deadline)?;
             if value.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
@@ -89,8 +98,20 @@ impl InspectorSession {
             .unwrap_or(Value::Null))
     }
 
-    fn read_value(&mut self) -> Result<Value, String> {
+    fn read_value(&mut self, deadline: Instant) -> Result<Value, String> {
         loop {
+            if Instant::now() >= deadline {
+                return Err("Electron Inspector 命令超时。".to_string());
+            }
+            if let MaybeTlsStream::Plain(stream) = self.socket.get_mut() {
+                stream
+                    .set_read_timeout(Some(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .max(Duration::from_millis(1)),
+                    ))
+                    .map_err(|error| error.to_string())?;
+            }
             match self.socket.read().map_err(|error| error.to_string())? {
                 Message::Text(text) => {
                     return serde_json::from_str(&text).map_err(|error| error.to_string())
@@ -252,11 +273,14 @@ pub fn launch_with_transparent_wco(
         return Err("Grok 可执行文件不存在。".to_string());
     }
     let inspector_port = select_inspector_port(renderer_port)?;
+    let mut fuse_lease = crate::fuse_guard::prepare_launch(executable, inspector_port)?;
+    fuse_lease.ensure_helper_alive()?;
     let mut child = Command::new(executable)
         .args([
             "--remote-debugging-address=127.0.0.1".to_string(),
             format!("--remote-debugging-port={renderer_port}"),
             format!("--inspect=127.0.0.1:{inspector_port}"),
+            format!("--grok-background-lease={}", fuse_lease.nonce),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -264,6 +288,13 @@ pub fn launch_with_transparent_wco(
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|error| format!("启动 Grok 失败：{error}"))?;
+
+    // Fault injection is compiled out of release packages. It covers the
+    // CreateProcess-to-Inspector-close crash window against the real helper.
+    #[cfg(feature = "integration-test-pipe")]
+    if std::env::var("GROK_TEST_ABORT_AFTER_SPAWN").as_deref() == Ok("1") {
+        std::process::exit(87);
+    }
 
     let result = (|| {
         let target = wait_for_inspector(inspector_port)?;
@@ -280,6 +311,12 @@ pub fn launch_with_transparent_wco(
             return Err("Electron 原生标题栏透明补丁未成功安装。".to_string());
         }
 
+        // The patch is resident in memory; renderer readiness does not need a
+        // privileged listener. Close it before waiting for the UI.
+        schedule_inspector_close(&mut session)?;
+        drop(session);
+        wait_for_inspector_close(inspector_port)?;
+
         let deadline = Instant::now() + RENDERER_WAIT;
         let browser_id = loop {
             if let Ok(browser_id) = read_browser_identity(renderer_port) {
@@ -293,9 +330,6 @@ pub fn launch_with_transparent_wco(
             thread::sleep(Duration::from_millis(250));
         };
 
-        schedule_inspector_close(&mut session)?;
-        drop(session);
-        wait_for_inspector_close(inspector_port)?;
         Ok(browser_id)
     })();
 
@@ -304,7 +338,53 @@ pub fn launch_with_transparent_wco(
         let _ = child.kill();
         let _ = child.wait();
     }
-    result
+    let recovery_ready = fuse_lease.ensure_helper_alive();
+    drop(fuse_lease);
+    match (result, recovery_ready) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(browser_id), Ok(())) => Ok(browser_id),
+    }
+}
+
+/// The worker can crash after CreateProcess and before recording a PID. A nonce
+/// persisted BEFORE spawn identifies that launch without relying on PID alone.
+pub(crate) fn close_interrupted_inspector(
+    port: u16,
+    nonce: &str,
+    processes: &[crate::managed_launch::ProcessRecord],
+) -> Result<(), String> {
+    if port == 0 {
+        return Err("恢复记录的 Inspector 端口无效。".to_string());
+    }
+    let targets = match fetch_json::<Vec<InspectorTarget>>(port, "/json/list") {
+        Ok(targets) => targets,
+        Err(_) => return Ok(()), // already closed, or not listening yet; helper retries while alive
+    };
+    for target in targets
+        .into_iter()
+        .filter(|target| target.target_type == "node")
+    {
+        let mut session = InspectorSession::open(&target, port)?;
+        let identity = session.evaluate("({pid:process.pid,type:process.type,exe:process.execPath,nonce:process.mainModule.require('electron').app.commandLine.getSwitchValue('grok-background-lease')})")?;
+        let executable = identity["exe"]
+            .as_str()
+            .unwrap_or_default()
+            .replace('/', "\\");
+        let matches = identity["type"].as_str() == Some("browser")
+            && executable.eq_ignore_ascii_case(crate::fuse_guard::TARGET)
+            && processes
+                .iter()
+                .any(|p| Some(u64::from(p.key.pid)) == identity["pid"].as_u64())
+            && identity["nonce"].as_str() == Some(nonce);
+        if !matches {
+            return Err("恢复助手发现 Inspector 身份不符，拒绝执行命令。".to_string());
+        }
+        schedule_inspector_close(&mut session)?;
+        drop(session);
+        wait_for_inspector_close(port)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -332,13 +332,31 @@ pub fn snapshot_executable_processes(executable: &str) -> Result<Vec<ProcessReco
     }
 }
 
+/// 恢复文件前的保守快照：任何同名候选无法确认身份或枚举不完整都会失败。
+/// 空列表只是完整快照的结论，调用者仍须通过 EXE 独占句柄防止随后启动的竞争。
+pub fn snapshot_executable_processes_strict(
+    executable: &str,
+) -> Result<Vec<ProcessRecord>, String> {
+    #[cfg(windows)]
+    {
+        windows_snapshot::snapshot_executable_processes_strict(executable)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = executable;
+        Err("严格进程快照仅支持 Windows，无法确认目标已退出。".to_string())
+    }
+}
+
 #[cfg(windows)]
 mod windows_snapshot {
     use super::{
         normalize_executable_path, parse_remote_debugging_port, ProcessKey, ProcessRecord,
     };
     use std::path::Path;
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_NO_MORE_FILES, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
@@ -455,6 +473,49 @@ mod windows_snapshot {
     }
 
     pub fn snapshot_executable_processes(executable: &str) -> Result<Vec<ProcessRecord>, String> {
+        snapshot_with_policy(executable, false)
+    }
+
+    pub fn snapshot_executable_processes_strict(
+        executable: &str,
+    ) -> Result<Vec<ProcessRecord>, String> {
+        snapshot_with_policy(executable, true)
+    }
+
+    fn checked_identity(
+        pid: u32,
+        image: Option<String>,
+        created_at: Option<u64>,
+        strict: bool,
+    ) -> Result<Option<(String, u64)>, String> {
+        match (image, created_at) {
+            (Some(image), Some(created_at)) => Ok(Some((image, created_at))),
+            _ if strict => Err(format!(
+                "无法查询同名进程 PID {pid} 的路径或创建时间，不能确认 Grok 已完全退出。"
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    fn check_open_process(opened: bool, pid: u32, strict: bool) -> Result<(), String> {
+        if strict && !opened {
+            return Err(format!(
+                "无法打开同名进程 PID {pid}，不能确认 Grok 已完全退出。"
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_enumeration_end(error: u32, strict: bool) -> Result<(), String> {
+        if strict && error != ERROR_NO_MORE_FILES {
+            return Err(format!(
+                "进程快照枚举不完整（Windows 错误 {error}），不能确认 Grok 已完全退出。"
+            ));
+        }
+        Ok(())
+    }
+
+    fn snapshot_with_policy(executable: &str, strict: bool) -> Result<Vec<ProcessRecord>, String> {
         let target = normalize_executable_path(executable);
         let target_name =
             exe_file_name(&target).ok_or_else(|| "目标可执行路径无效。".to_string())?;
@@ -477,17 +538,25 @@ mod windows_snapshot {
         };
         let mut records = Vec::new();
         let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
+        if ok == 0 {
+            check_enumeration_end(unsafe { GetLastError() }, strict)?;
+        }
         while ok != 0 {
             let name = utf16_to_string(&entry.szExeFile).to_ascii_lowercase();
             if name == target_name {
                 let handle = unsafe {
                     OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID)
                 };
-                if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                let opened = !handle.is_null() && handle != INVALID_HANDLE_VALUE;
+                check_open_process(opened, entry.th32ProcessID, strict)?;
+                if opened {
                     let process = HandleGuard(handle);
-                    if let (Some(image), Some(created_at)) =
-                        (query_image_path(process.0), query_creation_time(process.0))
-                    {
+                    if let Some((image, created_at)) = checked_identity(
+                        entry.th32ProcessID,
+                        query_image_path(process.0),
+                        query_creation_time(process.0),
+                        strict,
+                    )? {
                         if normalize_executable_path(&image) == target {
                             let command_line = query_command_line(process.0);
                             let debug_port = command_line
@@ -509,8 +578,62 @@ mod windows_snapshot {
                 }
             }
             ok = unsafe { Process32NextW(snapshot, &mut entry) };
+            if ok == 0 {
+                check_enumeration_end(unsafe { GetLastError() }, strict)?;
+            }
         }
         Ok(records)
+    }
+
+    #[cfg(test)]
+    mod strict_tests {
+        use super::*;
+
+        #[test]
+        fn strict_rejects_inaccessible_same_name_process() {
+            assert!(check_open_process(false, 42, true).is_err());
+            assert!(check_open_process(true, 42, true).is_ok());
+            assert!(check_open_process(false, 42, false).is_ok());
+        }
+
+        #[test]
+        fn strict_rejects_each_missing_identity_field() {
+            for (image, time) in [
+                (None, Some(123)),
+                (Some("C:\\other\\Grok Bot.exe".to_string()), None),
+                (None, None),
+            ] {
+                assert!(checked_identity(42, image.clone(), time, true).is_err());
+                assert_eq!(checked_identity(42, image, time, false).unwrap(), None);
+            }
+            let image = "C:\\app\\Grok Bot.exe".to_string();
+            assert_eq!(
+                checked_identity(42, Some(image.clone()), Some(123), true).unwrap(),
+                Some((image, 123))
+            );
+        }
+
+        #[test]
+        fn strict_accepts_only_normal_enumeration_completion() {
+            assert!(check_enumeration_end(ERROR_NO_MORE_FILES, true).is_ok());
+            // ERROR_SUCCESS 也不能把枚举 API 返回失败解释为正常结束。
+            for error in [0, 5, 24, 299] {
+                assert!(check_enumeration_end(error, true).is_err());
+                assert!(check_enumeration_end(error, false).is_ok());
+            }
+        }
+
+        #[test]
+        fn strict_snapshot_sees_current_test_process() {
+            let executable = std::env::current_exe().unwrap();
+            let records = crate::managed_launch::snapshot_executable_processes_strict(
+                &executable.to_string_lossy(),
+            )
+            .expect("strict snapshot of current test process");
+            assert!(records.iter().any(|record| {
+                record.key.pid == std::process::id() && record.key.created_at > 0
+            }));
+        }
     }
 }
 
