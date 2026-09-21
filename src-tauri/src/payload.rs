@@ -193,6 +193,41 @@ mod tests {
     }
 
     #[test]
+    fn activity_indicator_reuses_chat_background_without_a_card_fill() {
+        let css = generated::BACKGROUND_CSS.replace("\r\n", "\n");
+        assert!(css.contains(".sand-message:not(.sand-activity-line):not(.sand-activity-mark)"));
+        assert!(!css.contains("html.grok-background-active .sand-message {"));
+        let rule = css
+            .split("html.grok-background-active .sand-message.sand-activity-line,\nhtml.grok-background-active .sand-message.sand-activity-mark {")
+            .nth(1)
+            .expect("both compact and full-width activity variants have a reversible override")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(rule.contains("background: transparent !important"));
+        assert!(rule.contains("background-color: transparent !important"));
+        assert!(rule.contains("box-shadow: none !important"));
+        assert!(
+            !rule.contains("opacity:"),
+            "keep status text and dots visible"
+        );
+    }
+
+    #[test]
+    fn cursor_agent_card_uses_configured_card_opacity() {
+        let rule = generated::BACKGROUND_CSS
+            .split("html.grok-background-active .sand-cursor-agent-card,")
+            .nth(1)
+            .expect("Cursor task article participates in the card fill rule")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(rule.contains("var(--cbg-card-opacity)"));
+        assert!(rule.contains("box-shadow: none !important"));
+        assert!(!rule.contains("opacity:"), "do not fade card content");
+    }
+
+    #[test]
     fn keeps_large_media_out_of_cdp_script() {
         let bytes = vec![0x5a; 1024 * 1024];
         let payload = build_active_payload_from_bytes(

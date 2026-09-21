@@ -272,8 +272,10 @@ html.grok-background-active .ui-scroll-area__viewport {
   background-color: transparent !important;
   box-shadow: none !important;
 }
+/* Cursor 任务卡片有独立的 article 底色，仅外层 wrapper 透明还不够。 */
+html.grok-background-active .sand-cursor-agent-card,
 html.grok-background-active .sand-agent-item,
-html.grok-background-active .sand-message {
+html.grok-background-active .sand-message:not(.sand-activity-line):not(.sand-activity-mark) {
   background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-card-opacity) * 100%), transparent) !important;
   background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-card-opacity) * 100%), transparent) !important;
   box-shadow: none !important;
@@ -286,6 +288,16 @@ html.grok-background-active .sand-agent-item:hover,
 html.grok-background-active .sand-agent-item:focus-visible {
   background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 100%), transparent) !important;
   background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 100%), transparent) !important;
+}
+/* 运行中三点提示也带 sand-message，但不是消息卡片。
+ * line 为紧凑文字提示，mark 为整行图标提示，状态切换时两种都要覆盖。
+ * 清空活动行自身底色，直接沿用下方聊天背景的透明度，避免重复叠色；
+ * 不修改 opacity 或子元素，保留提示圆点、文字与工作动画。 */
+html.grok-background-active .sand-message.sand-activity-line,
+html.grok-background-active .sand-message.sand-activity-mark {
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
 }
 html.grok-background-active .sand-chat-stage,
 html.grok-background-active .sand-chat-input-dock,
