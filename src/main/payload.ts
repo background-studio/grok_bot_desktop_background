@@ -273,12 +273,18 @@ html.grok-background-active .ui-scroll-area__viewport {
   box-shadow: none !important;
 }
 /* Cursor 任务卡片有独立的 article 底色，仅外层 wrapper 透明还不够。 */
+html.grok-background-active .sand-widget:is(.sand-widget--choices, .sand-widget--resolved, .sand-widget--dismissed),
 html.grok-background-active .sand-cursor-agent-card,
 html.grok-background-active .sand-agent-item,
 html.grok-background-active .sand-message:not(.sand-activity-line):not(.sand-activity-mark) {
   background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-card-opacity) * 100%), transparent) !important;
   background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-card-opacity) * 100%), transparent) !important;
   box-shadow: none !important;
+}
+/* 提问卡片内层选项列表不再叠加实底，仅重设该卡片局部的列表底色变量。
+ * 不覆盖按钮样式，保留官方 hover/selected/disabled/focus 和 A/B 快捷键提示。 */
+html.grok-background-active .sand-widget:is(.sand-widget--choices, .sand-widget--resolved, .sand-widget--dismissed) {
+  --sand-fill-widget-option: transparent;
 }
 html.grok-background-active .sand-agents-sidebar {
   background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 28%), transparent) !important;

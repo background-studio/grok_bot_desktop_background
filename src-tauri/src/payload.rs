@@ -228,6 +228,30 @@ mod tests {
     }
 
     #[test]
+    fn choice_widgets_use_one_card_fill_and_preserve_interaction_styles() {
+        let css = generated::BACKGROUND_CSS;
+        let selector = "html.grok-background-active .sand-widget:is(.sand-widget--choices, .sand-widget--resolved, .sand-widget--dismissed)";
+        let rule = css
+            .split(&format!("{selector},"))
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(rule.contains("var(--cbg-card-opacity)"));
+        assert!(rule.contains("box-shadow: none !important"));
+        assert!(!rule.contains("opacity:"));
+        let inner = css
+            .split(&format!("{selector} {{"))
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert_eq!(inner.trim(), "--sand-fill-widget-option: transparent;");
+    }
+
+    #[test]
     fn keeps_large_media_out_of_cdp_script() {
         let bytes = vec![0x5a; 1024 * 1024];
         let payload = build_active_payload_from_bytes(
