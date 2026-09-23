@@ -12,3 +12,4 @@ poc/
 .grok-test.png
 build/
 
+.bce-tool/
