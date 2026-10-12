@@ -329,6 +329,46 @@ html.grok-background-active .sand-kit-message-input-frame [contenteditable="true
   background: transparent !important;
   background-color: transparent !important;
 }
+/* Grok 0.70：浮在背景上的 elevated 控件（Bot 列表顶部搜索 / 新建、右栏分享 / 关闭等圆形图标按钮、
+ * 侧栏底部“连接应用”入口）原生用 --sand-bg-elevated 实底，盖在背景上是一个个黑块。
+ * 只在这些控件上重设该变量，底色跟随卡片不透明度；悬停反馈是叠在 background-image 上的
+ * --sand-bg-hover，不受影响；“连接应用”里应用图标的描边圈继承同一变量，与按钮底色保持一致。 */
+html.grok-background-active :is(.sand-kit-icon-button, [data-sidebar-marketplace]) {
+  --sand-bg-elevated: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-card-opacity) * 100%), transparent) !important;
+}
+/* 聊天顶部身份胶囊悬浮在滚动消息之上，太透会和下面的文字叠在一起，按悬浮菜单不透明度处理。 */
+html.grok-background-active .sand-chat-header__identity {
+  --sand-bg-elevated: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-menu-opacity) * 100%), transparent) !important;
+}
+/* Grok 0.70 右栏“详情 / 资料库 / 电脑”页签条是 sticky 的 --sand-bg-chrome 实底，
+ * 下方还有一条 chrome → 透明的渐变阴影，盖在背景上成了一道黑带。
+ * 页签条与渐变都清空，只改底色，保留官方页签文字、选中态和键盘焦点。 */
+html.grok-background-active #sand-conversation-details :has(> [role="tablist"]) {
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
+html.grok-background-active #sand-conversation-details [role="tablist"] ~ span[aria-hidden="true"] {
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+}
+/* 右栏“电脑”页签的预览舞台（休眠等状态）原生是实底卡片，跟随卡片不透明度；
+ * 只改底色，保留官方的浅色叠层与描边；屏幕开启后由 webview 自己铺满舞台。 */
+html.grok-background-active .sand-computer-preview__frame [data-stage] {
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-card-opacity) * 100%), transparent) !important;
+}
+/* 新建聊天“收件人”下拉：外层 .sand-new-chat-menu 是 --sand-bg-elevated 实底，
+ * 内层 listbox 又按菜单规则铺了一层，叠起来等于实底。外层跟随菜单不透明度，内层清空避免叠色。 */
+html.grok-background-active .sand-new-chat-menu {
+  background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-menu-opacity) * 100%), transparent) !important;
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-menu-opacity) * 100%), transparent) !important;
+  backdrop-filter: none !important;
+}
+html.grok-background-active .sand-new-chat-menu [role="listbox"] {
+  background: transparent !important;
+  background-color: transparent !important;
+}
 /* 右侧 Agent Computer 的 webview/iframe 保持自身画面，不把聊天背景规则传进去。 */
 html.grok-background-active #sand-conversation-details iframe,
 html.grok-background-active #sand-conversation-details webview {

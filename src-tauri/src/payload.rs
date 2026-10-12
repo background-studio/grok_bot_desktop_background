@@ -193,6 +193,47 @@ mod tests {
     }
 
     #[test]
+    fn grok_070_elevated_controls_and_tab_strip_follow_background() {
+        let css = generated::BACKGROUND_CSS.replace("\r\n", "\n");
+        let rule = |selector: &str| -> String {
+            css.split(&format!("{selector} {{"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing rule {selector}"))
+                .split('}')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let controls = rule(
+            "html.grok-background-active :is(.sand-kit-icon-button, [data-sidebar-marketplace])",
+        );
+        assert!(controls.contains("--sand-bg-elevated:"));
+        assert!(controls.contains("var(--cbg-card-opacity)"));
+        // 只重设底色变量，悬停叠层（background-image）保持官方实现。
+        assert!(!controls.contains("background-image"));
+        assert!(
+            rule("html.grok-background-active .sand-chat-header__identity")
+                .contains("var(--cbg-menu-opacity)")
+        );
+        assert!(rule(
+            "html.grok-background-active #sand-conversation-details :has(> [role=\"tablist\"])"
+        )
+        .contains("background-color: transparent !important"));
+        assert!(rule("html.grok-background-active #sand-conversation-details [role=\"tablist\"] ~ span[aria-hidden=\"true\"]")
+            .contains("background-image: none !important"));
+        assert!(
+            rule("html.grok-background-active .sand-computer-preview__frame [data-stage]")
+                .contains("var(--cbg-card-opacity)")
+        );
+        assert!(rule("html.grok-background-active .sand-new-chat-menu")
+            .contains("var(--cbg-menu-opacity)"));
+        assert!(
+            rule("html.grok-background-active .sand-new-chat-menu [role=\"listbox\"]")
+                .contains("background: transparent !important")
+        );
+    }
+
+    #[test]
     fn activity_indicator_reuses_chat_background_without_a_card_fill() {
         let css = generated::BACKGROUND_CSS.replace("\r\n", "\n");
         assert!(css.contains(".sand-message:not(.sand-activity-line):not(.sand-activity-mark)"));
