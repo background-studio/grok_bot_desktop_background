@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     fs,
     net::TcpListener,
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -14,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
 
 use crate::{
-    electron_wco::launch_with_transparent_wco,
+    electron_wco::{launch_with_transparent_wco, WcoLaunch},
     injector::{native_titlebar_bridge_ready, read_browser_identity, InjectorEngine},
     managed_launch::{
-        snapshot_executable_processes, Observation, ProcessRecord, ProcessTracker, WatcherAction,
-        MSG_AUTO_APPLIED, MSG_DEBUG_TIMEOUT, MSG_EXISTING, MSG_SUSPENDED, MSG_TAKING_OVER,
-        MSG_WAITING,
+        snapshot_executable_processes, snapshot_executable_processes_strict, Observation,
+        ProcessKey, ProcessRecord, ProcessTracker, WatcherAction, MSG_AUTO_APPLIED,
+        MSG_DEBUG_TIMEOUT, MSG_EXISTING, MSG_SUSPENDED, MSG_TAKING_OVER, MSG_WAITING,
     },
     models::RuntimeStatus,
     payload::ActivePayload,
@@ -29,6 +30,57 @@ use crate::{
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const PREFERRED_DEBUG_PORT: u16 = 9337;
 const RUNTIME_SCHEMA_VERSION: u8 = 2;
+/// 强制结束后先同步等这么久；多数情况下 Grok 在此期间就已彻底退出。
+const EXIT_QUICK_WAIT: Duration = Duration::from_secs(15);
+/// 官方外观重启后观察这么久，确认新进程没有因单实例锁被放弃。
+const OFFICIAL_LAUNCH_SETTLE: Duration = Duration::from_secs(20);
+const RELAUNCH_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+const RELAUNCH_MAX_ATTEMPTS: u8 = 10;
+/// 等旧进程退出的总时长上限；超过后报错，避免无限期停在"等待退出"。
+const RELAUNCH_MAX_WAIT: Duration = Duration::from_secs(600);
+
+pub const MSG_WAIT_EXIT_MANAGED: &str = "等待旧的 Grok 进程完全退出，随后自动重启并应用背景";
+pub const MSG_WAIT_EXIT_OFFICIAL: &str = "等待旧的 Grok 进程完全退出，随后自动以官方外观重启";
+const MSG_RELAUNCH_FAILED: &str =
+    "旧的 Grok 进程长时间未释放，自动重启多次失败，请稍后手动启动 Grok。";
+
+/// 强制结束后 Grok（Electron）进程可能在进程表中滞留数十秒到数分钟，期间仍占着
+/// 单实例锁、严格快照也无法确认其身份。这时不报错放弃，而是登记待重启，由 watcher
+/// 在旧进程真正消失后重新启动，保证被插件关掉的 Grok 一定会被拉起来。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelaunchKind {
+    /// 带调试端口与透明标题栏补丁重启并注入背景。
+    Managed,
+    /// 以官方外观（无调试参数）重启。
+    Official,
+}
+
+struct RelaunchPlan {
+    kind: RelaunchKind,
+    /// 登记时仍滞留的旧进程；出现不在其中的新进程说明用户已自行启动了 Grok。
+    lingering: HashSet<ProcessKey>,
+    /// 本插件为重启而拉起的主进程 PID，不能被当成"用户自行启动"。
+    own_pids: HashSet<u32>,
+    attempts: u8,
+    not_before: Instant,
+    /// 首次登记待重启的时间，重试时沿用。
+    since: Instant,
+    /// 官方外观重启后正在观察的子进程：若它很快自行退出，需重试。
+    watch: Option<(Child, Instant)>,
+}
+
+pub enum RelaunchPoll {
+    Waiting,
+    Due,
+    Superseded(RelaunchKind),
+}
+
+pub enum RelaunchOutcome {
+    Attached,
+    Official,
+    Retrying,
+    Idle,
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -211,7 +263,23 @@ fn session_has_wco(port: u16, browser_id: &str) -> bool {
     native_titlebar_bridge_ready(port, browser_id).unwrap_or(false)
 }
 
-fn stop_verified_grok(install: &GrokInstall) -> Result<(), String> {
+/// 与恢复/修改可执行文件前相同的严格判定：任何同名进程无法确认身份都视为未退出；
+fn grok_fully_exited(install: &GrokInstall) -> bool {
+    matches!(
+        snapshot_executable_processes_strict(&install.executable),
+        Ok(processes) if processes.is_empty()
+    )
+}
+
+fn lingering_keys(install: &GrokInstall) -> HashSet<ProcessKey> {
+    snapshot_executable_processes(&install.executable)
+        .map(|processes| processes.into_iter().map(|process| process.key).collect())
+        .unwrap_or_default()
+}
+
+/// 结束所有路径匹配的 Grok 进程。返回 `false` 表示快速等待窗口内仍未彻底退出，
+/// 调用方须登记待重启而不是立即启动。
+fn stop_verified_grok(install: &GrokInstall) -> Result<bool, String> {
     let script = format!(
         r#"
 $ErrorActionPreference = 'Stop'
@@ -228,17 +296,17 @@ exit 0
         powershell_quote(&normalized_path(&install.executable))
     );
     run_powershell(&script, Duration::from_secs(30))?;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !process_ids_for(install)?.is_empty() {
+    let deadline = Instant::now() + EXIT_QUICK_WAIT;
+    while !grok_fully_exited(install) {
         if Instant::now() >= deadline {
-            return Err("Grok 未能在 15 秒内完全退出。".to_string());
+            return Ok(false);
         }
         thread::sleep(Duration::from_millis(300));
     }
-    Ok(())
+    Ok(true)
 }
 
-fn launch_grok(install: &GrokInstall, arguments: &[String]) -> Result<(), String> {
+fn launch_grok(install: &GrokInstall, arguments: &[String]) -> Result<Child, String> {
     let executable = PathBuf::from(&install.executable);
     if !executable.is_file() {
         return Err("Grok 可执行文件不存在。".to_string());
@@ -249,8 +317,7 @@ fn launch_grok(install: &GrokInstall, arguments: &[String]) -> Result<(), String
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| format!("启动 Grok 失败：{error}"))?;
-    Ok(())
+        .map_err(|error| format!("启动 Grok 失败：{error}"))
 }
 
 fn select_port(preferred: u16) -> Result<u16, String> {
@@ -287,6 +354,7 @@ pub struct GrokController {
     install_cache: Option<GrokInstall>,
     tracker: ProcessTracker,
     watcher_paused: bool,
+    relaunch: Option<RelaunchPlan>,
 }
 
 impl GrokController {
@@ -308,6 +376,7 @@ impl GrokController {
             install_cache: None,
             tracker: ProcessTracker::new(),
             watcher_paused: false,
+            relaunch: None,
         }
     }
 
@@ -427,7 +496,9 @@ impl GrokController {
     pub fn auto_takeover(&mut self, payload: ActivePayload) -> Result<RuntimeStatus, String> {
         self.set_managed_status("starting", MSG_TAKING_OVER);
         self.apply(payload, true)?;
-        self.set_managed_status("active", MSG_AUTO_APPLIED);
+        if self.status.phase == "active" {
+            self.set_managed_status("active", MSG_AUTO_APPLIED);
+        }
         Ok(self.status())
     }
 
@@ -459,6 +530,265 @@ impl GrokController {
         {
             self.engine = None;
         }
+    }
+
+    pub fn relaunch_pending(&self) -> bool {
+        self.relaunch.is_some()
+    }
+
+    /// 暂停（含恢复官方外观）期间不再注入，待重启统一按官方外观执行。
+    fn effective_relaunch_kind(&self, kind: RelaunchKind) -> RelaunchKind {
+        if self.watcher_paused {
+            RelaunchKind::Official
+        } else {
+            kind
+        }
+    }
+
+    fn show_relaunch_wait(&mut self, kind: RelaunchKind) {
+        let (phase, message) = match self.effective_relaunch_kind(kind) {
+            RelaunchKind::Managed => ("starting", MSG_WAIT_EXIT_MANAGED),
+            RelaunchKind::Official => ("restoring", MSG_WAIT_EXIT_OFFICIAL),
+        };
+        self.set_managed_status(phase, message);
+        self.status.active_targets = 0;
+    }
+
+    fn fail_relaunch(&mut self, error: &str) {
+        self.relaunch = None;
+        self.set_managed_error(error);
+    }
+
+    fn schedule_relaunch(
+        &mut self,
+        install: &GrokInstall,
+        kind: RelaunchKind,
+        attempts: u8,
+        own_pid: Option<u32>,
+        delay: Duration,
+    ) {
+        let (mut own_pids, since) = self
+            .relaunch
+            .take()
+            .map(|plan| (plan.own_pids, plan.since))
+            .unwrap_or_else(|| (HashSet::new(), Instant::now()));
+        own_pids.extend(own_pid);
+        self.relaunch = Some(RelaunchPlan {
+            kind,
+            lingering: lingering_keys(install),
+            own_pids,
+            attempts,
+            not_before: Instant::now() + delay,
+            since,
+            watch: None,
+        });
+        self.show_relaunch_wait(kind);
+    }
+
+    fn finish_official_relaunch(&mut self, kind: RelaunchKind) {
+        if self.watcher_paused && kind == RelaunchKind::Managed {
+            self.set_managed_status("paused", MSG_SUSPENDED);
+        } else if kind == RelaunchKind::Official {
+            self.set_managed_status("idle", "已恢复官方外观");
+        } else {
+            self.set_managed_status("idle", "已重新启动 Grok");
+        }
+        self.status.active_targets = 0;
+    }
+
+    /// 以官方外观启动（先还原临时安全开关），并登记观察新进程是否很快自行退出。
+    fn launch_official_watched(
+        &mut self,
+        install: &GrokInstall,
+        kind: RelaunchKind,
+        attempts: u8,
+    ) -> Result<(), String> {
+        let child = {
+            let _launch_guard = crate::fuse_guard::restore_before_official_launch()?;
+            launch_grok(install, &[])?
+        };
+        let (mut own_pids, since) = self
+            .relaunch
+            .take()
+            .map(|plan| (plan.own_pids, plan.since))
+            .unwrap_or_else(|| (HashSet::new(), Instant::now()));
+        own_pids.insert(child.id());
+        self.relaunch = Some(RelaunchPlan {
+            kind,
+            lingering: HashSet::new(),
+            own_pids,
+            attempts,
+            not_before: Instant::now(),
+            since,
+            watch: Some((child, Instant::now() + OFFICIAL_LAUNCH_SETTLE)),
+        });
+        self.finish_official_relaunch(kind);
+        Ok(())
+    }
+
+    /// watcher 每个 tick 调用：判断旧进程是否已彻底退出、用户是否已自行启动 Grok。
+    pub fn poll_relaunch(&mut self) -> Result<RelaunchPoll, String> {
+        let install = self.cached_install()?;
+        let Some(plan) = self.relaunch.as_mut() else {
+            return Ok(RelaunchPoll::Waiting);
+        };
+        let kind = plan.kind;
+        if let Some((child, deadline)) = plan.watch.as_mut() {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                let attempts = plan.attempts.saturating_add(1);
+                if attempts >= RELAUNCH_MAX_ATTEMPTS {
+                    self.fail_relaunch(MSG_RELAUNCH_FAILED);
+                    return Err(MSG_RELAUNCH_FAILED.to_string());
+                }
+                self.schedule_relaunch(&install, kind, attempts, None, RELAUNCH_RETRY_INTERVAL);
+            } else if Instant::now() >= *deadline {
+                self.relaunch = None;
+            }
+            return Ok(RelaunchPoll::Waiting);
+        }
+        let records = snapshot_executable_processes(&install.executable)?;
+        let user_launched = records.iter().any(|record| {
+            !plan.lingering.contains(&record.key) && !plan.own_pids.contains(&record.key.pid)
+        });
+        if user_launched {
+            self.relaunch = None;
+            if self.effective_relaunch_kind(kind) == RelaunchKind::Official {
+                self.finish_official_relaunch(kind);
+            }
+            return Ok(RelaunchPoll::Superseded(kind));
+        }
+        let not_before = plan.not_before;
+        let since = plan.since;
+        let due = Instant::now() >= not_before && grok_fully_exited(&install);
+        if !due && since.elapsed() >= RELAUNCH_MAX_WAIT {
+            self.fail_relaunch(MSG_RELAUNCH_FAILED);
+            return Err(MSG_RELAUNCH_FAILED.to_string());
+        }
+        self.show_relaunch_wait(kind);
+        Ok(if due {
+            RelaunchPoll::Due
+        } else {
+            RelaunchPoll::Waiting
+        })
+    }
+
+    /// 旧进程已彻底退出后由 watcher 调用：按待重启类型重新启动 Grok。
+    pub fn run_pending_relaunch(
+        &mut self,
+        payload: Option<ActivePayload>,
+    ) -> Result<RelaunchOutcome, String> {
+        let Some(plan) = self.relaunch.as_ref() else {
+            return Ok(RelaunchOutcome::Idle);
+        };
+        if plan.watch.is_some() {
+            return Ok(RelaunchOutcome::Idle);
+        }
+        let kind = plan.kind;
+        let attempts = plan.attempts;
+        let install = match self.cached_install() {
+            Ok(install) => install,
+            Err(error) => {
+                self.fail_relaunch(&error);
+                return Err(error);
+            }
+        };
+        if !grok_fully_exited(&install) {
+            return Ok(RelaunchOutcome::Retrying);
+        }
+        let payload = match self.effective_relaunch_kind(kind) {
+            RelaunchKind::Managed => payload,
+            RelaunchKind::Official => None,
+        };
+        let Some(payload) = payload else {
+            if let Err(error) = self.launch_official_watched(&install, kind, attempts) {
+                return self.retry_after_launch_error(&install, kind, attempts, None, error, false);
+            }
+            return Ok(RelaunchOutcome::Official);
+        };
+        self.set_managed_status("starting", "正在重新启动 Grok");
+        let launched = select_port(PREFERRED_DEBUG_PORT).and_then(|port| {
+            launch_with_transparent_wco(Path::new(&install.executable), port)
+                .map(|launch| (port, launch))
+        });
+        match launched {
+            Ok((port, WcoLaunch::Ready(browser_id))) => {
+                if let Err(error) = self.attach_launched(&install, port, browser_id, payload) {
+                    self.fail_relaunch(&error);
+                    return Err(error);
+                }
+                self.set_managed_status("active", MSG_AUTO_APPLIED);
+                Ok(RelaunchOutcome::Attached)
+            }
+            Ok((_, WcoLaunch::ExitedEarly { pid })) => self.retry_after_launch_error(
+                &install,
+                kind,
+                attempts,
+                Some(pid),
+                MSG_RELAUNCH_FAILED.to_string(),
+                true,
+            ),
+            Err(error) => {
+                self.retry_after_launch_error(&install, kind, attempts, None, error, false)
+            }
+        }
+    }
+
+    /// 被插件关掉的 Grok 必须重新拉起来，启动失败不能直接放弃：
+    /// - 仍有滞留进程（含刚失败的这次启动留下的）时继续等待，不计入失败次数，
+    ///   总时长由 `RELAUNCH_MAX_WAIT` 兜底；
+    /// - 进程已清空仍失败，则计一次失败，间隔后重试，达到上限才报告最后一次错误。
+    fn retry_after_launch_error(
+        &mut self,
+        install: &GrokInstall,
+        kind: RelaunchKind,
+        attempts: u8,
+        own_pid: Option<u32>,
+        error: String,
+        always_count: bool,
+    ) -> Result<RelaunchOutcome, String> {
+        // 映像仍被占用（刚结束的进程或杀毒扫描）同属"尚未完全退出"，不计失败次数。
+        let still_exiting =
+            crate::fuse_guard::is_image_in_use(&error) || !grok_fully_exited(install);
+        let attempts = if always_count || !still_exiting {
+            attempts.saturating_add(1)
+        } else {
+            attempts
+        };
+        if attempts >= RELAUNCH_MAX_ATTEMPTS {
+            let error = format!("{MSG_RELAUNCH_FAILED}（{error}）");
+            self.fail_relaunch(&error);
+            return Err(error);
+        }
+        self.schedule_relaunch(install, kind, attempts, own_pid, RELAUNCH_RETRY_INTERVAL);
+        Ok(RelaunchOutcome::Retrying)
+    }
+
+    /// 记录新启动的调试会话并开始注入。
+    fn attach_launched(
+        &mut self,
+        install: &GrokInstall,
+        port: u16,
+        browser_id: String,
+        payload: ActivePayload,
+    ) -> Result<(), String> {
+        self.write_state(Some(RuntimeState {
+            schema_version: RUNTIME_SCHEMA_VERSION,
+            port,
+            browser_id: browser_id.clone(),
+            wco_enabled: true,
+            package_full_name: install.package_full_name.clone(),
+            executable: install.executable.clone(),
+            created_at: Utc::now().to_rfc3339(),
+        }))?;
+        let mut engine = InjectorEngine::new(port, browser_id);
+        engine.start(payload)?;
+        self.engine = Some(engine);
+        self.relaunch = None;
+        self.status.phase = "active".to_string();
+        self.status.message = "背景已应用".to_string();
+        self.status.last_error = None;
+        self.status.grok_version = Some(install.version.clone());
+        Ok(())
     }
 
     fn write_state(&mut self, state: Option<RuntimeState>) -> Result<(), String> {
@@ -582,31 +912,68 @@ impl GrokController {
                 self.status.grok_version = Some(install.version);
                 return Ok(self.status());
             }
+            // 正在等待被结束的旧进程退出：不再重复结束/等待，保持待重启即可。
+            if let Some(plan) = self.relaunch.as_mut() {
+                if plan.watch.is_none() {
+                    let records = snapshot_executable_processes(&install.executable)?;
+                    let only_lingering = records
+                        .iter()
+                        .all(|record| plan.lingering.contains(&record.key));
+                    if only_lingering && !grok_fully_exited(&install) {
+                        plan.kind = RelaunchKind::Managed;
+                        self.show_relaunch_wait(RelaunchKind::Managed);
+                        return Ok(self.status());
+                    }
+                }
+            }
             let running = process_ids_for(&install)?;
             if !running.is_empty() && !restart_existing {
                 return Err("Grok 需要重启一次以启用背景。".to_string());
             }
-            if !running.is_empty() {
-                stop_verified_grok(&install)?;
+            let killed = !running.is_empty();
+            let exited = if !killed {
+                grok_fully_exited(&install)
+            } else {
+                stop_verified_grok(&install)?
+            };
+            if !exited {
+                // 已被结束但仍滞留在进程表中，此时启动会被单实例锁或严格快照拦下。
+                self.schedule_relaunch(&install, RelaunchKind::Managed, 0, None, Duration::ZERO);
+                return Ok(self.status());
             }
             let port = select_port(PREFERRED_DEBUG_PORT)?;
-            let browser_id = launch_with_transparent_wco(Path::new(&install.executable), port)?;
-            self.write_state(Some(RuntimeState {
-                schema_version: RUNTIME_SCHEMA_VERSION,
-                port,
-                browser_id: browser_id.clone(),
-                wco_enabled: true,
-                package_full_name: install.package_full_name,
-                executable: install.executable,
-                created_at: Utc::now().to_rfc3339(),
-            }))?;
-            let mut engine = InjectorEngine::new(port, browser_id);
-            engine.start(payload)?;
-            self.engine = Some(engine);
-            self.status.phase = "active".to_string();
-            self.status.message = "背景已应用".to_string();
-            self.status.grok_version = Some(install.version);
-            Ok(self.status())
+            let launched = match launch_with_transparent_wco(Path::new(&install.executable), port) {
+                Ok(launched) => launched,
+                // 刚被本插件结束的 Grok 不能就此停在关闭状态：转入待重启继续尝试。
+                Err(error) if killed => {
+                    self.retry_after_launch_error(
+                        &install,
+                        RelaunchKind::Managed,
+                        0,
+                        None,
+                        error,
+                        false,
+                    )?;
+                    return Ok(self.status());
+                }
+                Err(error) => return Err(error),
+            };
+            match launched {
+                WcoLaunch::Ready(browser_id) => {
+                    self.attach_launched(&install, port, browser_id, payload)?;
+                    Ok(self.status())
+                }
+                WcoLaunch::ExitedEarly { pid } => {
+                    self.schedule_relaunch(
+                        &install,
+                        RelaunchKind::Managed,
+                        1,
+                        Some(pid),
+                        RELAUNCH_RETRY_INTERVAL,
+                    );
+                    Ok(self.status())
+                }
+            }
         })();
         if let Err(error) = &result {
             self.status.phase = if error.contains("需要重启一次") {
@@ -616,6 +983,9 @@ impl GrokController {
             };
             self.status.message = error.clone();
             self.status.last_error = Some(error.clone());
+        }
+        if result.is_ok() && self.status.phase == "active" {
+            self.relaunch = None;
         }
         result
     }
@@ -642,20 +1012,51 @@ impl GrokController {
             }
             match self.cached_install() {
                 Ok(install) => {
+                    let watching = self
+                        .relaunch
+                        .as_ref()
+                        .is_some_and(|plan| plan.watch.is_some());
+                    let mut pending = false;
                     if !process_ids_for(&install)?.is_empty() {
-                        stop_verified_grok(&install)?;
-                        let _launch_guard = crate::fuse_guard::restore_before_official_launch()?;
-                        launch_grok(&install, &[])?;
+                        if watching {
+                            // 刚以官方外观重启过且仍在观察，不再重复结束。
+                        } else if stop_verified_grok(&install)? {
+                            self.launch_official_watched(&install, RelaunchKind::Official, 0)?;
+                        } else {
+                            pending = true;
+                        }
+                    } else if self.relaunch.is_some() && !watching {
+                        // 之前被结束的 Grok 尚未重启：改为以官方外观重启。
+                        pending = true;
                     } else {
                         crate::fuse_guard::restore_before_official_launch()?;
                     }
-                    self.status.grok_version = Some(install.version);
+                    self.status.grok_version = Some(install.version.clone());
+                    if pending {
+                        self.schedule_relaunch(
+                            &install,
+                            RelaunchKind::Official,
+                            0,
+                            None,
+                            Duration::ZERO,
+                        );
+                    } else if let Some(plan) = self.relaunch.as_mut() {
+                        plan.kind = RelaunchKind::Official;
+                    }
                 }
                 Err(_) => {}
             }
             self.write_state(None)?;
-            self.status.phase = "idle".to_string();
-            self.status.message = "已恢复官方外观".to_string();
+            if self
+                .relaunch
+                .as_ref()
+                .is_some_and(|plan| plan.watch.is_none())
+            {
+                self.show_relaunch_wait(RelaunchKind::Official);
+            } else {
+                self.status.phase = "idle".to_string();
+                self.status.message = "已恢复官方外观".to_string();
+            }
             self.status.active_targets = 0;
             Ok(self.status())
         })();

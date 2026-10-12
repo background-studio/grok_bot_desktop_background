@@ -154,6 +154,28 @@ fn wait_for_exit() -> Result<(), String> {
     Err(last_error)
 }
 
+/// 进程快照已为空，但被强制结束的 Electron 进程仍可能映射着 EXE 映像（或杀毒软件
+/// 正在扫描刚修改过的 EXE），此时独占打开会报共享冲突。这属于"尚未完全退出"，
+/// 调用方应等待重试，而不是当作恢复失败。注意：不要为探测而主动以写方式打开 EXE，
+/// 每次写打开关闭都会触发杀毒软件重新扫描这个 200MB+ 的文件，反而一直占着它。
+pub const MSG_IMAGE_IN_USE: &str = "Grok 进程已结束，但系统仍未释放 Grok Bot.exe，等待完全退出。";
+
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
+fn open_target_exclusive(executable: &Path) -> Result<File, String> {
+    exclusive(executable, false).map_err(|error| {
+        if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+            io_error(MSG_IMAGE_IN_USE)
+        } else {
+            io_error(error)
+        }
+    })
+}
+
+pub fn is_image_in_use(error: &str) -> bool {
+    error.contains(MSG_IMAGE_IN_USE)
+}
+
 fn bytes_from(file: &mut File) -> Result<Vec<u8>, String> {
     file.seek(SeekFrom::Start(0)).map_err(io_error)?;
     let mut bytes = Vec::new();
@@ -252,7 +274,7 @@ fn restore_locked(directory: &Path, executable: &Path) -> Result<(), String> {
             .map_err(io_error)?;
     let mut backup = fs::read(directory.join("original.exe")).map_err(io_error)?;
     validate_backup(&journal, executable, &mut backup)?;
-    let mut file = exclusive(executable, false).map_err(io_error)?;
+    let mut file = open_target_exclusive(executable)?;
     let current = hash(&bytes_from(&mut file)?);
     if current == journal.original_sha256 {
         // Already restored, or this version originally allowed Inspector.
@@ -369,7 +391,7 @@ pub fn prepare_launch(executable: &Path, inspector_port: u16) -> Result<LaunchLe
     };
     wait_for_exit()?;
     restore_locked(&directory, executable)?;
-    let mut file = exclusive(executable, false).map_err(io_error)?;
+    let mut file = open_target_exclusive(executable)?;
     let mut bytes = bytes_from(&mut file)?;
     let offset = inspect_offset(&bytes)?;
     let original_value = bytes[offset];
@@ -479,18 +501,22 @@ pub fn run_helper() -> Result<(), String> {
             }
             let pending = fs::read(directory.join("pending.json")).map_err(io_error)?;
             match snapshot_executable_processes(TARGET) {
+                // 被结束的进程仍在退出（快照里已看不到，但映像仍被映射）：属于正常的
+                // 退出滞留，继续等待，不记录为恢复错误，以免阻断托管流程。
                 Ok(processes) if processes.is_empty() => {
                     match restore_locked(&directory, Path::new(TARGET)) {
                         Ok(()) => return Ok(()),
+                        // 映像仍被刚结束的进程（或杀毒扫描）占用：正常退出滞留，只重试。
+                        Err(error) if is_image_in_use(&error) => {}
                         Err(error) => {
                             // Keep evidence and retry: antivirus and late-exiting children can hold handles.
                             record_recovery_result(&directory, &pending, Err(error));
                         }
                     }
                 }
-                Err(error) => {
-                    record_recovery_result(&directory, &pending, Err(error));
-                }
+                // 严格快照无法确认身份/枚举不完整，几乎总是刚被结束的进程尚在退出；
+                // 同样只重试，不作为恢复错误上报（真正的还原失败仍会在上面记录）。
+                Err(_) => {}
                 Ok(processes) => {
                     let journal = (|| {
                         let journal: Journal = serde_json::from_slice(

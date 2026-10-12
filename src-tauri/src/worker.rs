@@ -10,11 +10,11 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{
-    controller::GrokController,
+    controller::{GrokController, RelaunchKind, RelaunchOutcome, RelaunchPoll},
     lock,
     managed_launch::{
         confirm_launch_after_encode, keys_of, process_key_list, BusyGuard, ConfirmedLaunch,
-        WatcherAction, WatcherState, MSG_BUSY, MSG_EXISTING, MSG_UNCONFIGURED,
+        WatcherAction, WatcherState, MSG_BUSY, MSG_EXISTING, MSG_UNCONFIGURED, MSG_WAITING,
     },
     media::download_configured_media,
     models::RuntimeStatus,
@@ -313,6 +313,10 @@ impl WorkerState {
         if self.shutting_down.load(Ordering::SeqCst) || self.managed_busy.load(Ordering::Acquire) {
             return Ok(());
         }
+        // 待重启优先于一切：即便尚未配置/已暂停，被插件关掉的 Grok 也必须重新拉起。
+        if self.tick_pending_relaunch()? {
+            return Ok(());
+        }
         if !self.is_configured()? {
             if let Ok(mut controller) = self.controller.try_lock() {
                 if !controller.watcher_paused() && controller.status().phase != "paused" {
@@ -428,6 +432,66 @@ impl WorkerState {
                         Err(error)
                     }
                 }
+            }
+        }
+    }
+
+    /// 处理登记过的待重启。返回 `true` 表示本 tick 已处理完毕（或控制器正忙）。
+    fn tick_pending_relaunch(&self) -> Result<bool, String> {
+        let mut controller = match self.controller.try_lock() {
+            Ok(controller) => controller,
+            Err(_) => return Ok(true),
+        };
+        if !controller.relaunch_pending() {
+            return Ok(false);
+        }
+        match controller.poll_relaunch() {
+            Ok(RelaunchPoll::Waiting) => {
+                drop(controller);
+                let _ = self.refresh_runtime_status();
+                Ok(true)
+            }
+            Ok(RelaunchPoll::Superseded(kind)) => {
+                // 用户在等待期间自己启动了 Grok：交还给常规托管流程，按新启动处理。
+                let hand_over = kind == RelaunchKind::Managed && !controller.watcher_paused();
+                if hand_over {
+                    controller.set_managed_status("idle", MSG_WAITING);
+                }
+                drop(controller);
+                if hand_over {
+                    lock(&self.watcher)?.takeover_failed(&[]);
+                }
+                let _ = self.refresh_runtime_status();
+                Ok(true)
+            }
+            Ok(RelaunchPoll::Due) => {
+                let Some(_busy) = BusyGuard::acquire(&self.managed_busy) else {
+                    return Ok(true);
+                };
+                let payload = self.active_payload().ok();
+                let result = controller.run_pending_relaunch(payload);
+                drop(controller);
+                match &result {
+                    Ok(RelaunchOutcome::Attached) => {
+                        let _ = self.sync_managed_active();
+                    }
+                    Ok(
+                        RelaunchOutcome::Official
+                        | RelaunchOutcome::Retrying
+                        | RelaunchOutcome::Idle,
+                    ) => {}
+                    Err(_) => {
+                        let _ = self.sync_managed_failure();
+                    }
+                }
+                let _ = self.refresh_runtime_status();
+                result.map(|_| true)
+            }
+            Err(error) => {
+                drop(controller);
+                let _ = self.sync_managed_failure();
+                let _ = self.refresh_runtime_status();
+                Err(error)
             }
         }
     }

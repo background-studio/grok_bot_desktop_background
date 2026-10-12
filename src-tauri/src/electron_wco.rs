@@ -2,7 +2,7 @@ use std::{
     net::{TcpListener, TcpStream},
     os::windows::process::CommandExt,
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -20,6 +20,14 @@ const INSPECTOR_WAIT: Duration = Duration::from_secs(15);
 const RENDERER_WAIT: Duration = Duration::from_secs(45);
 
 const WCO_PATCH: &str = include_str!("../../src/main/native-titlebar.cjs");
+
+pub enum WcoLaunch {
+    Ready(String),
+    /// 新进程没打开 Inspector 就自行退出：旧实例仍持有单实例锁。
+    ExitedEarly {
+        pid: u32,
+    },
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -202,7 +210,8 @@ fn fetch_json<T: for<'de> Deserialize<'de>>(port: u16, resource: &str) -> Result
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
-fn wait_for_inspector(port: u16) -> Result<InspectorTarget, String> {
+/// 返回 `None` 表示被启动的进程在 Inspector 就绪前已自行退出。
+fn wait_for_inspector(port: u16, child: &mut Child) -> Result<Option<InspectorTarget>, String> {
     let deadline = Instant::now() + INSPECTOR_WAIT;
     loop {
         let attempt_error = match fetch_json::<Vec<InspectorTarget>>(port, "/json/list") {
@@ -212,12 +221,15 @@ fn wait_for_inspector(port: u16) -> Result<InspectorTarget, String> {
                         && validate_inspector_websocket(&target.web_socket_debugger_url, port)
                             .is_ok()
                 }) {
-                    return Ok(target);
+                    return Ok(Some(target));
                 }
                 "未找到 Electron Node Inspector target".to_string()
             }
             Err(error) => error,
         };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return Ok(None);
+        }
         if Instant::now() >= deadline {
             return Err(format!(
                 "Grok 主进程 Inspector 未能启动（可能被 Electron fuse 禁用）：{attempt_error}"
@@ -268,7 +280,7 @@ fn wait_for_inspector_close(port: u16) -> Result<(), String> {
 pub fn launch_with_transparent_wco(
     executable: &Path,
     renderer_port: u16,
-) -> Result<String, String> {
+) -> Result<WcoLaunch, String> {
     if !executable.is_file() {
         return Err("Grok 可执行文件不存在。".to_string());
     }
@@ -297,7 +309,9 @@ pub fn launch_with_transparent_wco(
     }
 
     let result = (|| {
-        let target = wait_for_inspector(inspector_port)?;
+        let Some(target) = wait_for_inspector(inspector_port, &mut child)? else {
+            return Ok(WcoLaunch::ExitedEarly { pid: child.id() });
+        };
         let mut session = InspectorSession::open(&target, inspector_port)?;
         session.command("Runtime.enable", json!({}))?;
         let identity = session.evaluate("({ pid: process.pid, type: process.type })")?;
@@ -330,7 +344,7 @@ pub fn launch_with_transparent_wco(
             thread::sleep(Duration::from_millis(250));
         };
 
-        Ok(browser_id)
+        Ok(WcoLaunch::Ready(browser_id))
     })();
 
     if result.is_err() {
@@ -343,7 +357,7 @@ pub fn launch_with_transparent_wco(
     match (result, recovery_ready) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
-        (Ok(browser_id), Ok(())) => Ok(browser_id),
+        (Ok(launch), Ok(())) => Ok(launch),
     }
 }
 
